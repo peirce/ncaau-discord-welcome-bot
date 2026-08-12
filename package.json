@@ -1,0 +1,24 @@
+{
+  "name": "ncaau-discord-welcome-bot",
+  "version": "0.0.1",
+  "description": "NCAAU Discord welcome committee bot.",
+  "main": "ncaau-discord-welcome-bot.js",
+  "scripts": {
+    "start": "node --env-file=.env ncaau-discord-welcome-bot.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/peirce/ncaau-discord-welcome-bot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/peirce/ncaau-discord-welcome-bot/issues"
+  },
+  "homepage": "https://github.com/peirce/ncaau-discord-welcome-bot#readme",
+  "dependencies": {
+    "discord.js": "^14.27.0"
+  }
+}
