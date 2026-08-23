@@ -14,18 +14,20 @@ It also keeps some basic stats: how many people joined, how many got greeted, ho
 
 ## The bot's slash commands
 
-While the bot is running, anyone in the Discord server can use these slash commands. (In the commands below, uppercase indicates something you have to replace when entering the command.)
+While the bot is running, Welcome Committee members can use these slash commands. The two `stats` commands are the exception: anyone in the server can run those. (In the commands below, uppercase indicates something you have to replace when entering the command.)
 
-| Command | What it does |
-| --- | --- |
-| `/welcome rotation` | Shows the full rotation queue and any snoozes. |
-| `/welcome whosup` | Shows who's next in the welcome rotation. |
-| `/welcome greeter skiptoback USER` | Moves them to the back of the rotation queue. |
-| `/welcome greeter skiptofront USER` | Moves them to the front of the rotation queue. |
-| `/welcome greeter snooze USER DATE` | Pauses someone from the rotation until DATE (YYYY-MM-DD). |
-| `/welcome greeter unsnooze USER` | Cancels the snooze early: Returns someone to the rotation. |
-| `/welcome stats` | Shows join count, reach-out rate, reply rate, and intro-post rate for the last 30 days. |
-| `/welcome stats DAYS` | Shows the same stats for the last DAYS days. |
+| Command | Who can use it | What it does |
+| --- | --- | --- |
+| `/welcome rotation` | Committee | Shows the full rotation queue and any snoozes. |
+| `/welcome whosup` | Committee | Shows who's next in the welcome rotation. |
+| `/welcome greeter skiptoback USER` | Committee | Moves them to the back of the rotation queue. |
+| `/welcome greeter skiptofront USER` | Committee | Moves them to the front of the rotation queue. |
+| `/welcome greeter snooze USER DATE` | Committee | Pauses someone from the rotation until DATE (YYYY-MM-DD). |
+| `/welcome greeter unsnooze USER` | Committee | Cancels the snooze early: Returns someone to the rotation. |
+| `/welcome stats` | Anyone | Shows join count, reach-out rate, reply rate, and intro-post rate for the last 30 days. |
+| `/welcome stats DAYS` | Anyone | Shows the same stats for the last DAYS days. |
+
+Discord still lists every command for everyone, so a non-committee member who tries a restricted one gets a private "committee members only" reply that nobody else in the channel sees.
 
 There is no command for adding or removing a greeter. Committee membership is managed outside this bot: the bot only reads the Welcome Committee role and never adds or removes it. To add or remove someone, assign or unassign that role in Discord (by hand, or however your server hands out roles). The rotation picks up the change on its own.
 

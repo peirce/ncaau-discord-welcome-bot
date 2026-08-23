@@ -7,6 +7,7 @@
 // Also watches the 👋-introductions channel and posts back in the Welcome Committee channel
 // the first time a tracked newcomer posts there.
 // Commands: /welcome rotation, /welcome whosup, /welcome greeter skiptoback|skiptofront|snooze|unsnooze @user, /welcome stats
+// Slash commands are shown to everyone but only Welcome Committee role holders can execute them, except /welcome stats.
 // Note: membership of the Welcome Committee role is managed externally (e.g. Carl-bot reaction roles);
 // this bot only reads the role, never adds/removes it.
 // Also auto-posts a weekly summary to the channel.
@@ -73,12 +74,19 @@ function saveData() {
   }
 }
 
+// Aside from stats commands, only only committee members can run slash commands
+function isCommittee(interaction) {
+  const roles = interaction.member?.roles;
+  if (!roles) return false;
+  return Array.isArray(roles) ? roles.includes(ROLE_ID) : roles.cache.has(ROLE_ID);
+}
+
 function isSnoozed(userId) {
   const until = data.snoozed[userId];
   return !!until && new Date().toISOString().slice(0, 10) < until;
 }
 
-// rotation order: longest-waiting first (never-assigned counts as 0); snoozed members excluded
+// Rotation order: longest-waiting first (never-assigned counts as 0); snoozed members excluded
 function rotationOrder(committee) {
   return [...committee.values()]
     .filter((m) => !isSnoozed(m.id))
@@ -89,7 +97,7 @@ function rotationOrder(committee) {
     });
 }
 
-// shared stats text for /stats and the weekly post
+// Shared stats text for /stats and the weekly post
 function buildStatsText(days, title) {
   const cutoff = Date.now() - days * 86400000;
   const records = Object.values(data.welcomes).filter((r) => r.joinedAt >= cutoff);
@@ -191,7 +199,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
     return;
   }
 
-  await guild.members.fetch(); // populate cache so the role filter is complete
+  await guild.members.fetch(); // populates cache so the role filter is complete
   const committee = guild.members.cache.filter((m) => m.roles.cache.has(ROLE_ID) && !m.user.bot);
   const available = rotationOrder(committee); // excludes snoozed members
 
@@ -310,6 +318,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   const group = interaction.options.getSubcommandGroup(false);
   const sub   = interaction.options.getSubcommand();
+
+  // Slash commands are shown to everyone, but aside from stats commands, only only committee members can run them, 
+  // so non-members get a private error message.
+  const isStats = !group && sub === 'stats';
+  if (!isStats && !isCommittee(interaction)) {
+    await interaction.reply({
+      content: `Sorry — only <@&${ROLE_ID}> members can use that command. (\`/welcome stats\` is open to everyone.)`,
+      allowedMentions: { parse: [] },
+      ephemeral: true,
+    });
+    return;
+  }
 
   if (group === 'greeter') {
     const target = interaction.options.getMember('user');
