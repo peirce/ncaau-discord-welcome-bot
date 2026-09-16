@@ -1,26 +1,7 @@
 
-// ncaau-discord-welcome-bot.js
-// On join: posts in the Welcome Committee channel, tags the new member + the
-// committee member whose turn it is (longest-waiting), and pre-adds ✅ and 🗨.
-//   ✅  = a committee member reached out
-//   🗨  = the newcomer replied
-// Also watches the 👋-introductions channel and posts back in the Welcome Committee channel
-// the first time a tracked newcomer posts there.
-// Commands: /welcome rotation, /welcome whosup, /welcome greeter skiptoback|skiptofront|snooze|unsnooze @user, /welcome stats
-// Slash commands are shown to everyone but only Welcome Committee role holders can execute them, except /welcome stats.
-// Note: membership of the Welcome Committee role is managed externally (e.g. Carl-bot reaction roles);
-// this bot only reads the role, never adds/removes it.
-// Also auto-posts a weekly summary to the channel.
-//
-// Requires:
-//    Node.js 22.12+
-//      npm install discord.js
-// Run via command... node --env-file=.env ncaau-discord-welcome-bot.js
-// The .env file contains DISCORD_TOKEN, GUILD_ID, CHANNEL_ID, ROLE_ID, INTRO_CHANNEL_ID.
-
 const fs = require('node:fs');
 const {
-  Client, GatewayIntentBits, Events, Partials, SlashCommandBuilder,
+  Client, GatewayIntentBits, Events, Partials, SlashCommandBuilder, MessageType, SystemChannelFlagsBitField,
 } = require('discord.js');
 
 // ---------------- CONFIG ----------------
@@ -28,7 +9,7 @@ const TOKEN       = process.env.DISCORD_TOKEN;  // From .env file
 const GUILD_ID    = process.env.GUILD_ID;    // NCAAU Discord SERVER id
 const CHANNEL_ID  = process.env.CHANNEL_ID;  // 👋-welcome-committee CHANNEL id
 const ROLE_ID     = process.env.ROLE_ID;     // Welcome Committee ROLE id
-const INTRO_ID    = process.env.INTRO_CHANNEL_ID; // 👋-introductions CHANNEL id (optional — blank turns the watch off)
+const INTRO_ID    = process.env.INTRO_CHANNEL_ID; // 👋-introductions CHANNEL id (optional -- blank turns the watch off)
 const STATE_FILE  = './welcome-data.json';
 const WEEKLY_DAY  = 1;  // Weekly summary day: 0=Sun, 1=Mon ... 6=Sat
 const WEEKLY_HOUR = 9;  // Weekly summary hour (24h), in the HOST machine's local time
@@ -74,15 +55,18 @@ function saveData() {
   }
 }
 
-// Aside from stats commands, only only committee members can run slash commands
+// Aside from stats commands, only committee members can run slash commands
 function isCommittee(interaction) {
   const roles = interaction.member?.roles;
   if (!roles) return false;
   return Array.isArray(roles) ? roles.includes(ROLE_ID) : roles.cache.has(ROLE_ID);
 }
 
+const INDEFINITE = 'indefinite'; // data.snoozed value for a snooze with no return date
+
 function isSnoozed(userId) {
   const until = data.snoozed[userId];
+  if (until === INDEFINITE) return true;
   return !!until && new Date().toISOString().slice(0, 10) < until;
 }
 
@@ -97,33 +81,39 @@ function rotationOrder(committee) {
     });
 }
 
+const RULE = '━'.repeat(28);
+
 // Shared stats text for /stats and the weekly post
 function buildStatsText(days, title) {
   const cutoff = Date.now() - days * 86400000;
   const records = Object.values(data.welcomes).filter((r) => r.joinedAt >= cutoff);
   const joins = records.length;
-  if (joins === 0) return `${title}\nNo joins recorded in the last ${days} day${days === 1 ? '' : 's'}.`;
+  if (joins === 0) {
+    return [RULE, title, `No joins recorded in the last ${days} day${days === 1 ? '' : 's'}.`, RULE].join('\n');
+  }
   const reached = records.filter((r) => r.reachedOut).length;
   const replied = records.filter((r) => r.replied).length;
   const intros  = records.filter((r) => r.introPostedAt).length;
   const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
   const lines = [
+    RULE,
     title,
     `New joins: ${joins}`,
     `✅ Reached out: ${reached} (${pct(reached, joins)}% of joins)`,
     `🗨 Replied: ${replied} (${pct(replied, joins)}% of joins · ${pct(replied, reached)}% of those contacted)`,
   ];
-  // Counted by the bot itself, not from reactions — so it's only shown when the watch is on.
+  // Counted by the bot itself, not from reactions -- so it's only shown when the watch is on.
   if (INTRO_ID) lines.push(`📝 Posted an intro: ${intros} (${pct(intros, joins)}% of joins)`);
+  lines.push(RULE);
   return lines.join('\n');
 }
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,          // privileged — toggle ON in the Dev Portal
-    GatewayIntentBits.GuildMessageReactions, // standard — no portal toggle
-    GatewayIntentBits.GuildMessages,         // standard — needed to see posts in 👋-introductions
+    GatewayIntentBits.GuildMembers,          // privileged -- toggle ON in the Dev Portal
+    GatewayIntentBits.GuildMessageReactions, // standard -- no portal toggle
+    GatewayIntentBits.GuildMessages,         // standard -- needed to see posts in 👋-introductions
   ],
   partials: [Partials.Message, Partials.Reaction, Partials.User], // catch reactions on uncached msgs
 });
@@ -132,30 +122,26 @@ const client = new Client({
 const welcomeCommand = new SlashCommandBuilder()
   .setName('welcome')
   .setDescription('Welcome Committee tools.')
-  .addSubcommandGroup((group) =>
-    group.setName('greeter')
-      .setDescription('Manage Welcome Committee rotation and availability.')
-      .addSubcommand((sub) =>
-        sub.setName('snooze')
-          .setDescription('Pauses someone from the rotation until DATE (YYYY-MM-DD).')
-          .addUserOption((opt) => opt.setName('user').setDescription('Member to snooze.').setRequired(true))
-          .addStringOption((opt) => opt.setName('until').setDescription('Return date (YYYY-MM-DD).').setRequired(true))
-      )
-      .addSubcommand((sub) =>
-        sub.setName('unsnooze')
-          .setDescription('Cancels the snooze early: Returns someone to the rotation.')
-          .addUserOption((opt) => opt.setName('user').setDescription('Member to unsnooze.').setRequired(true))
-      )
-      .addSubcommand((sub) =>
-        sub.setName('skiptoback')
-          .setDescription('Moves them to the back of the rotation queue.')
-          .addUserOption((opt) => opt.setName('user').setDescription('Committee member.').setRequired(true))
-      )
-      .addSubcommand((sub) =>
-        sub.setName('skiptofront')
-          .setDescription('Moves them to the front of the rotation queue.')
-          .addUserOption((opt) => opt.setName('user').setDescription('Committee member.').setRequired(true))
-      )
+  .addSubcommand((sub) =>
+    sub.setName('snooze')
+      .setDescription('Pauses someone from the rotation until DATE (YYYY-MM-DD), or indefinitely if no date.')
+      .addUserOption((opt) => opt.setName('user').setDescription('Member to snooze.').setRequired(true))
+      .addStringOption((opt) => opt.setName('until').setDescription('Return date (YYYY-MM-DD). Leave blank for no return date.'))
+  )
+  .addSubcommand((sub) =>
+    sub.setName('unsnooze')
+      .setDescription('Cancels the snooze early: Returns someone to the rotation.')
+      .addUserOption((opt) => opt.setName('user').setDescription('Member to unsnooze.').setRequired(true))
+  )
+  .addSubcommand((sub) =>
+    sub.setName('skiptoback')
+      .setDescription('Moves them to the back of the rotation queue.')
+      .addUserOption((opt) => opt.setName('user').setDescription('Committee member.').setRequired(true))
+  )
+  .addSubcommand((sub) =>
+    sub.setName('skiptofront')
+      .setDescription('Moves them to the front of the rotation queue.')
+      .addUserOption((opt) => opt.setName('user').setDescription('Committee member.').setRequired(true))
   )
   .addSubcommand((sub) =>
     sub.setName('rotation')
@@ -164,6 +150,13 @@ const welcomeCommand = new SlashCommandBuilder()
   .addSubcommand((sub) =>
     sub.setName('whosup')
       .setDescription("Shows who's next in the welcome rotation.")
+  )
+  .addSubcommand((sub) =>
+    sub.setName('pairs')
+      .setDescription('Shows which committee member greeted which new members, from the ✅ reactions.')
+      .addIntegerOption((opt) =>
+        opt.setName('days').setDescription('Or for the last how many days? (Default is 30.)').setMinValue(1)
+      )
   )
   .addSubcommand((sub) =>
     sub.setName('stats')
@@ -181,12 +174,29 @@ client.once(Events.ClientReady, async (c) => {
     await guild.commands.set([welcomeCommand.toJSON()]);
     console.log('The welcome-bot is on duty. Use /welcome to see a list of commands.');
   } catch (e) {
-    console.error('ERROR during startup — check GUILD_ID and bot permissions:', e);
+    console.error('ERROR during startup -- check GUILD_ID and bot permissions:', e);
     process.exit(1);
   }
   maybePostWeekly();
   setInterval(maybePostWeekly, 15 * 60 * 1000); // re-check every 15 min
 });
+
+// Discord posts a "X joined the server" system message.
+// Returns null if join notifications are off, or if there's no system channel, 
+// or if the bot can't see it any of which just means the prompt goes out with no link.
+async function findJoinMessageUrl(guild, member) {
+  if (guild.systemChannelFlags.has(SystemChannelFlagsBitField.Flags.SuppressJoinNotifications)) return null;
+  const sysChannel = guild.systemChannel;
+  if (!sysChannel) return null;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 1000));
+    const messages = await sysChannel.messages.fetch({ limit: 5 }).catch(() => null);
+    const joinMsg = messages?.find((m) => m.type === MessageType.UserJoin && m.author.id === member.id);
+    if (joinMsg) return joinMsg.url;
+  }
+  return null;
+}
 
 // ---- someone joins ----
 client.on(Events.GuildMemberAdd, async (member) => {
@@ -195,10 +205,11 @@ client.on(Events.GuildMemberAdd, async (member) => {
 
   const channel = await guild.channels.fetch(CHANNEL_ID).catch(() => null);
   if (!channel || !channel.isTextBased()) {
-    console.error('ERROR: Could not identify the Welcome channel — check CHANNEL_ID and permissions.');
+    console.error('ERROR: Could not identify the Welcome channel -- check CHANNEL_ID and permissions.');
     return;
   }
 
+  const joinMsgUrl = await findJoinMessageUrl(guild, member);
   await guild.members.fetch(); // populates cache so the role filter is complete
   const committee = guild.members.cache.filter((m) => m.roles.cache.has(ROLE_ID) && !m.user.bot);
   const available = rotationOrder(committee); // excludes snoozed members
@@ -213,7 +224,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
     };
     saveData();
     await channel.send({
-      content: `👋 Welcome <@${member.id}>! (${reason} — someone please say hi.)`,
+      content: `👋 Welcome <@${member.id}>! (${reason} -- someone please say hi.)` +
+        (joinMsgUrl ? `\n🔗 ${joinMsgUrl}` : ''),
       allowedMentions: { users: [member.id] },
     }).catch(() => {});
     return;
@@ -221,7 +233,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
 
   const greeter = available[0];
   const msg =
-    `<@${greeter.id}>, you're up — please reach out and say hello to <@${member.id}>. 🤝\n` +
+    `<@${greeter.id}>, you're up -- please reach out and say hello to <@${member.id}>. 🤝\n` +
+    (joinMsgUrl ? `🔗 ${joinMsgUrl}\n` : '') +
     `_React with ${REACHED_OUT} once you've reached out, and ${REPLIED} if they reply._`;
 
   try {
@@ -239,6 +252,20 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 });
 
+// ---- reactions ----
+// Each mark records WHO clicked, not just that someone did. 
+//   rec.greeterId is who the rotation assigned to welcome.
+//   reachedOutBy is who said they welcomed (by checkmarking).
+// The Welcome Committee role via carl-bot limits who's in the channel but there are other ways in, such as admins.
+// The role doesn't limit the stats in terms of who has credit and is paired with whom.
+// Credit goes to the first person to click. Every click is also kept, in order, so that if
+// the credited person removes their mark (correcting a mis-click) then credit can pass to the next one.
+// repliedConfirmedBy is whomever reported the newcomer's reply.
+const MARKS = {
+  [REACHED_OUT]: { flag: 'reachedOut', by: 'reachedOutBy',       at: 'reachedOutAt', clicks: 'reachedOutClicks' },
+  [REPLIED]:     { flag: 'replied',    by: 'repliedConfirmedBy', at: 'repliedAt',    clicks: 'repliedClicks' },
+};
+
 // ---- a reaction lands ----
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
   if (user.bot) return;
@@ -247,18 +274,66 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
   const rec = data.welcomes[reaction.message.id];
   if (!rec) return;
 
-  const emoji = normalizeEmoji(reaction.emoji?.name);
-  if (emoji !== REACHED_OUT && emoji !== REPLIED) return;
+  const mark = MARKS[normalizeEmoji(reaction.emoji?.name)];
+  if (!mark) return;
 
-  const guild = client.guilds.cache.get(GUILD_ID) ?? await client.guilds.fetch(GUILD_ID).catch(() => null);
-  if (!guild) return;
-  const member = guild.members.cache.get(user.id) ?? await guild.members.fetch(user.id).catch(() => null);
-  if (!member || !member.roles.cache.has(ROLE_ID)) return;
+  const clicks = (rec[mark.clicks] ??= []);
+  if (clicks.some((c) => c.id === user.id)) return;
+  const at = Date.now();
+  clicks.push({ id: user.id, at });
+  if (!rec[mark.flag]) {
+    rec[mark.flag] = true;
+    rec[mark.by] = user.id;
+    rec[mark.at] = at;
+  }
+  saveData();
+});
 
-  let changed = false;
-  if (emoji === REACHED_OUT && !rec.reachedOut) { rec.reachedOut = true; changed = true; }
-  if (emoji === REPLIED && !rec.replied) { rec.replied = true; changed = true; }
-  if (changed) saveData();
+// ---- a reaction is removed ----
+// If the credited member takes their mark back, credit passes to the earliest click the bot saw that's
+// still on the message. Failing that, to anyone still showing the mark (e.g. they clicked
+// while the bot was offline, so there's no click order to go by). Elsewise, the mark is cleared,
+// so a ✅ welcome goes back to awaiting a ✅ in /welcome pairs.
+client.on(Events.MessageReactionRemove, async (reaction, user) => {
+  if (user.bot) return;
+  if (reaction.partial) { try { await reaction.fetch(); } catch { return; } }
+
+  const rec = data.welcomes[reaction.message.id];
+  if (!rec) return;
+
+  const mark = MARKS[normalizeEmoji(reaction.emoji?.name)];
+  if (!mark) return;
+
+  const clicks = rec[mark.clicks] ?? [];
+  const wasCredited = rec[mark.by] === user.id;
+  if (!wasCredited && !clicks.some((c) => c.id === user.id)) return; // a click the bot never counted
+  rec[mark.clicks] = clicks.filter((c) => c.id !== user.id);
+
+  if (wasCredited) {
+    // Who has this mark on the message right now, per Discord. If Discord can't be reached, the
+    // bot's own click list is all there is to go on.
+    const onMessage = await reaction.users.fetch().catch(() => null);
+    if (onMessage) {
+      rec[mark.clicks] = rec[mark.clicks].filter((c) => onMessage.has(c.id)); // drops removals missed while offline
+      if (rec[mark.clicks].length === 0) {
+        for (const u of onMessage.values()) {
+          if (u.bot || u.id === user.id) continue;
+          rec[mark.clicks].push({ id: u.id, at: Date.now() }); // their real click time is unknown
+          break;
+        }
+      }
+    }
+    const next = rec[mark.clicks][0];
+    if (next) {
+      rec[mark.by] = next.id;
+      rec[mark.at] = next.at;
+    } else {
+      rec[mark.flag] = false;
+      delete rec[mark.by];
+      delete rec[mark.at];
+    }
+  }
+  saveData();
 });
 
 // ---- a newcomer posts in 👋-introductions ----
@@ -282,16 +357,17 @@ client.on(Events.MessageCreate, async (message) => {
   try {
     const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
     if (!channel || !channel.isTextBased()) {
-      console.error('ERROR: Could not identify the Welcome channel — check CHANNEL_ID and permissions.');
+      console.error('ERROR: Could not identify the Welcome channel -- check CHANNEL_ID and permissions.');
       return;
     }
 
     const [promptId, rec] = records[0];
-    // rec.greeterId is whoever was assigned to THIS newcomer back at join time — not whoever is
+    // rec.greeterId is whoever was assigned to THIS newcomer back at join time -- not whoever is
     // next in the rotation now. The rotation may have turned over many times since.
-    const greeterPing = rec.greeterId ? `<@${rec.greeterId}>, ` : '';
+    const lead = rec.greeterId ? `<@${rec.greeterId}>, in case` : 'In case';
+    // Discord renders message.url as "#channel > 🗨".
     const content =
-      `📝 ${greeterPing}<@${rec.memberId}> just posted in <#${INTRO_ID}> for the first time — ${message.url}`;
+      `📝 ${lead} you'd like to respond or react with an emoji, <@${rec.memberId}> posted in ${message.url}`;
     const allowedMentions = { users: rec.greeterId ? [rec.greeterId] : [] }; // ping their greeter, not the newcomer
 
     // Reply to the original welcome prompt so the committee sees it in context.
@@ -316,22 +392,20 @@ client.on(Events.MessageCreate, async (message) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'welcome') return;
 
-  const group = interaction.options.getSubcommandGroup(false);
-  const sub   = interaction.options.getSubcommand();
+  const sub = interaction.options.getSubcommand();
 
-  // Slash commands are shown to everyone, but aside from stats commands, only only committee members can run them, 
+  // Slash commands are shown to everyone, but aside from stats commands, only only committee members can run them,
   // so non-members get a private error message.
-  const isStats = !group && sub === 'stats';
-  if (!isStats && !isCommittee(interaction)) {
+  if (sub !== 'stats' && !isCommittee(interaction)) {
     await interaction.reply({
-      content: `Sorry — only <@&${ROLE_ID}> members can use that command. (\`/welcome stats\` is open to everyone.)`,
+      content: `Sorry -- only <@&${ROLE_ID}> members can use that command. (\`/welcome stats\` is open to everyone.)`,
       allowedMentions: { parse: [] },
       ephemeral: true,
     });
     return;
   }
 
-  if (group === 'greeter') {
+  if (['snooze', 'unsnooze', 'skiptoback', 'skiptofront'].includes(sub)) {
     const target = interaction.options.getMember('user');
     if (!target) {
       await interaction.reply({ content: 'Could not find that member.', ephemeral: true });
@@ -339,17 +413,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (sub === 'snooze') {
       const until = interaction.options.getString('until');
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(until)) {
-        await interaction.reply({ content: 'Date must be YYYY-MM-DD (e.g. 2026-07-20).', ephemeral: true });
-        return;
+      // null = no return date (indefinite vacation; also for welcomers who don't want to be in the rotation)
+      if (until !== null) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+          await interaction.reply({ content: 'Date must be YYYY-MM-DD (e.g. 2026-07-20), or leave it blank for no return date.', ephemeral: true });
+          return;
+        }
+        if (until <= new Date().toISOString().slice(0, 10)) {
+          await interaction.reply({ content: 'Return date must be in the future, or leave it blank for no return date.', ephemeral: true });
+          return;
+        }
       }
-      if (until <= new Date().toISOString().slice(0, 10)) {
-        await interaction.reply({ content: 'Return date must be in the future.', ephemeral: true });
-        return;
-      }
-      data.snoozed[target.id] = until;
+      data.snoozed[target.id] = until ?? INDEFINITE;
       saveData();
-      await interaction.reply({ content: `💤 Snoozed ${target.displayName} from the rotation until ${until}.` });
+      const howLong = until ? `until ${until}` : 'indefinitely, until someone runs `/welcome unsnooze`';
+      await interaction.reply({ content: `💤 Snoozed ${target.displayName} from the rotation ${howLong}.` });
     } else if (sub === 'unsnooze') {
       if (!data.snoozed[target.id]) {
         await interaction.reply({ content: `${target.displayName} is not currently snoozed.`, ephemeral: true });
@@ -390,7 +468,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     if (snoozed.length) {
       lines.push('');
-      lines.push('💤  Snoozed: ' + snoozed.map((m) => `${m.displayName} (back ${data.snoozed[m.id]})`).join(', '));
+      const back = (id) => (data.snoozed[id] === INDEFINITE ? 'no return date' : `back ${data.snoozed[id]}`);
+      lines.push('💤 Snoozed: ' + snoozed.map((m) => `${m.displayName} (${back(m.id)})`).join(', '));
     }
     await interaction.reply({ content: lines.join('\n'), allowedMentions: { parse: [] } });
     return;
@@ -409,9 +488,74 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (sub === 'pairs') {
+    const days = interaction.options.getInteger('days') ?? 30;
+    const cutoff = Date.now() - days * 86400000;
+    const title = `**Welcome pairings -- last ${days} day${days === 1 ? '' : 's'}**`;
+    const records = Object.values(data.welcomes)
+      .filter((r) => r.joinedAt >= cutoff)
+      .sort((a, b) => b.joinedAt - a.joinedAt); // newest join first
+    if (records.length === 0) {
+      await interaction.reply({ content: `${title}\nNo joins recorded in that window.` });
+      return;
+    }
+
+    const guild = interaction.guild;
+    await guild.members.fetch();
+    // Falls back to a silenced mention for anyone who has since left the server.
+    const nameOf = (id) => guild.members.cache.get(id)?.displayName ?? `<@${id}>`;
+
+    // Grouped by who clicked ✅, which is the real pairing -- not necessarily who the rotation assigned.
+    const byGreeter = new Map();
+    const pending = [];
+    let anyLegacy = false;
+    let anyHandover = false;
+    for (const rec of records) {
+      const id = rec.reachedOut ? (rec.reachedOutBy ?? rec.greeterId) : null;
+      if (!id) { pending.push(rec); continue; }
+      if (!byGreeter.has(id)) byGreeter.set(id, []);
+      byGreeter.get(id).push(rec);
+    }
+
+    const lines = [title];
+    for (const [id, recs] of [...byGreeter.entries()].sort((a, b) => b[1].length - a[1].length)) {
+      const names = recs.map((rec) => {
+        const marks = [];
+        if (rec.replied) marks.push(REPLIED);
+        if (rec.introPostedAt) marks.push('📝');
+        if (!rec.reachedOutBy) { marks.push('?'); anyLegacy = true; }
+        else if (rec.greeterId && rec.reachedOutBy !== rec.greeterId) {
+          marks.push(`(assigned to ${nameOf(rec.greeterId)})`);
+          anyHandover = true;
+        }
+        return marks.length ? `${rec.username} ${marks.join(' ')}` : rec.username;
+      });
+      lines.push(`${REACHED_OUT} **${nameOf(id)}** (${recs.length}): ${names.join(', ')}`);
+    }
+    if (byGreeter.size === 0) lines.push(`_(Nobody has clicked ${REACHED_OUT} on a welcome in this window.)_`);
+    if (pending.length) {
+      lines.push('');
+      lines.push(`⏳ **Awaiting a ${REACHED_OUT}:** ` + pending
+        .map((rec) => `${rec.username} (${rec.greeterId ? nameOf(rec.greeterId) : 'unassigned'})`)
+        .join(', '));
+    }
+
+    const legend = [`${REPLIED} replied`];
+    if (INTRO_ID) legend.push('📝 posted an intro');
+    if (anyHandover) legend.push('a name in parentheses is who the rotation had assigned');
+    if (anyLegacy) legend.push('? = greeted before the bot recorded who clicked');
+    lines.push('');
+    lines.push(`_Grouped by who clicked ${REACHED_OUT}. ${legend.join(' · ')}._`);
+
+    let content = lines.join('\n');
+    if (content.length > 1900) content = `${content.slice(0, 1900)}\n… _(truncated -- try a shorter days window)_`;
+    await interaction.reply({ content, allowedMentions: { parse: [] } });
+    return;
+  }
+
   if (sub === 'stats') {
     const days = interaction.options.getInteger('days') ?? 30;
-    const title = `**Welcome stats — last ${days} day${days === 1 ? '' : 's'}**`;
+    const title = `**Welcome stats -- last ${days} day${days === 1 ? '' : 's'}**`;
     await interaction.reply({ content: buildStatsText(days, title) });
     return;
   }
@@ -426,7 +570,7 @@ async function maybePostWeekly() {
 
   const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
-  await channel.send(buildStatsText(7, '📅  **Weekly welcome summary — last 7 days**')).catch(() => {});
+  await channel.send(buildStatsText(7, '📅  **Weekly welcome summary -- last 7 days**')).catch(() => {});
   data.lastWeekly = todayKey;
   saveData();
 }

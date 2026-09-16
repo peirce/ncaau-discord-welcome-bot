@@ -2,13 +2,15 @@
 
 ## What this bot does
 
-When someone joins the NCAAU Discord server, the bot posts a message in the Welcome Committee channel tagging the new member along with the committee member whose turn it is, and pre-adds the ✅ and 🗨 emojis to its own message so the committee can track follow-up with one click.
+When someone joins the NCAAU Discord server, the bot posts a message in the Welcome Committee channel tagging the new member along with the committee member whose turn it is, and pre-adds the ✅ and 🗨 emojis to its own message so the committee can track follow-up with one click. If the server has "someone joined" system messages turned on, the prompt also includes a 🔗 jump link straight to Discord's own join message for that member. If that setting is off, or the bot can't see the system channel, or the system message just hasn't arrived yet, the prompt is sent without a link.
 
 Whose turn it is = whoever has waited longest since they were last assigned. Someone who has never been assigned counts as waiting the longest, so new committee members go to the front. Members who are snoozed are skipped entirely.
 
 The bot reads the Welcome Committee role to find out who is on the committee.
 
 It optionally watches an introductions channel where new members might introduce themselves and notifies the newcomer's greeter about the introduction.
+
+It also records which committee member greeted which new member, taken from whoever clicked ✅ -- see `/welcome pairs`.
 
 It also keeps some basic stats: how many people joined, how many got greeted, how many replied, and how many posted an introduction. Joins and intro posts are tracked by the bot on its own; Greetings and replies come from the ✅ and 🗨 emoji reactions. The bot auto-posts a weekly summary to the Welcome Committee channel, and stats on demand with a customizable timespan.
 
@@ -20,16 +22,19 @@ While the bot is running, Welcome Committee members can use these slash commands
 | --- | --- | --- |
 | `/welcome rotation` | Committee | Shows the full rotation queue and any snoozes. |
 | `/welcome whosup` | Committee | Shows who's next in the welcome rotation. |
-| `/welcome greeter skiptoback USER` | Committee | Moves them to the back of the rotation queue. |
-| `/welcome greeter skiptofront USER` | Committee | Moves them to the front of the rotation queue. |
-| `/welcome greeter snooze USER DATE` | Committee | Pauses someone from the rotation until DATE (YYYY-MM-DD). |
-| `/welcome greeter unsnooze USER` | Committee | Cancels the snooze early: Returns someone to the rotation. |
+| `/welcome pairs` | Committee | Shows which committee member greeted which new members over the last 30 days. |
+| `/welcome pairs DAYS` | Committee | Shows the same pairings for the last DAYS days. |
+| `/welcome skiptoback USER` | Committee | Moves them to the back of the rotation queue. |
+| `/welcome skiptofront USER` | Committee | Moves them to the front of the rotation queue. |
+| `/welcome snooze USER DATE` | Committee | Pauses someone from the rotation until DATE (YYYY-MM-DD). |
+| `/welcome snooze USER` | Committee | Pauses someone from the rotation indefinitely, with no return date, until someone unsnoozes them. |
+| `/welcome unsnooze USER` | Committee | Cancels the snooze early: Returns someone to the rotation. |
 | `/welcome stats` | Anyone | Shows join count, reach-out rate, reply rate, and intro-post rate for the last 30 days. |
 | `/welcome stats DAYS` | Anyone | Shows the same stats for the last DAYS days. |
 
 Discord still lists every command for everyone, so a non-committee member who tries a restricted one gets a private "committee members only" reply that nobody else in the channel sees.
 
-There is no command for adding or removing a greeter. Committee membership is managed outside this bot: the bot only reads the Welcome Committee role and never adds or removes it. To add or remove someone, assign or unassign that role in Discord (by hand, or however your server hands out roles). The rotation picks up the change on its own.
+There is no command for adding or removing a greeter. Committee membership is managed outside this bot: The bot only reads the Welcome Committee role and never adds or removes it. To add or remove someone, assign or unassign that role in Discord (by hand, or however your server hands out roles). The rotation picks up the change on its own.
 
 ## Dev setup and basic file setup
 
@@ -42,6 +47,11 @@ There is no command for adding or removing a greeter. Committee membership is ma
 winget install OpenJS.NodeJS.LTS
 $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
 node --version
+```
+
+Needs Node.js 20.6 or newer, since the bot is launched with the `--env-file` flag, which doesn't exist before that version (the LTS install above already satisfies this). If `node --version` shows something older, update Node before continuing.
+
+```powershell
 cd D:\Main\activism\NCAAU\discord_bot\
 git clone https://github.com/peirce/ncaau-discord-welcome-bot.git
 cd ncaau-discord-welcome-bot
@@ -81,6 +91,8 @@ Go to...
     - Add Reactions
     - Use Slash Commands
 
+(If the bot needs rebuilt, Manage Roles might be a good permission to add, so the bot can look up ROLE_ID itself.)
+
 That results in a "Generated URL" at the bottom (a.k.a. "the invite link" which you will copy+paste into your message to the server admin.)
 
 Example invite link:
@@ -107,6 +119,7 @@ Send a message like this along with the invite link to a server owner: (Test on 
 5. Turn on Developer Mode (in User Settings which is the gear icon near your username --> Advanced section or Developer section --> toggle on Developer Mode).
 
 6. Right-click the Welcome Committee role --> Copy Role ID and send it to me please.
+...or ask carl-bot with a slash command such as... /role allroles
 
 I'll gather the other IDs and fire up the bot. I'll host the bot on my computer, unless you'd like it to be hosted somewhere else like your computer or a dedicated always-on system like Pi or a small VPS. (A bot is a continuous responsibility to maintain extremely high uptime, because it can only catch users joining the Discord server while the bot is running. Therefore if hosting on a PC, an uninterruptable power supply (UPS) is recommended for when weather-related outages and such inevitably occur since a backup generator usually isn't fast enough to prevent a PC from turning off.)
 ```
@@ -144,13 +157,9 @@ To test it without rebooting:
 
 ## Watching the introductions channel
 
-When the bot posts a welcome prompt, it records the new member's user ID alongside that message. Then it watches the introductions channel for the first time that new member posts there, at which point it replies to its own original welcome prompt message in the Welcome Committee channel:
+When the bot posts a welcome prompt, it records the new member's user ID alongside that message. Then it watches the introductions channel for the first time that new member posts there, at which point it replies to its own original welcome prompt message in the Welcome Committee channel.
 
-```text
-📝 @Greeter @Newcomer just posted in #👋-introductions for the first time — https://discord.com/channels/...
-```
-
-The point of that ping is so the greeter is aware someone they greeted has introduced themselves, so the greeter can go reply to the introduction message, if they so choose, to add that personal touch.
+The point is so the greeter is aware someone they greeted has introduced themselves, so the greeter can go reply to the introduction message, if they so choose, adding to the personal touch.
 
 Notes on how it behaves:
 
@@ -174,12 +183,24 @@ Stats are only as good as the emoji reactions Welcome Committee members add to t
 
 How emoji reactions get counted:
 
-- Only reactions from people who hold the Welcome Committee role count towards stats. If someone without the role clicks ✅, nothing is recorded. (Ideally members without the Welcome Committee role wouldn't have access to the channel anyway.)
+- Reactions count no matter which roles the person clicking holds. Anyone who can see the Welcome Committee channel can click ✅ or 🗨 and have it register. Roles aren't the only way to see the channel.
 
 - Only reactions on the bot's own welcome messages count. Reacting to some other message in the channel isn't counted.
 
-- The bot pre-adds ✅ and 🗨 to its own messages so Welcome Committee members don't have to search for the emoji. Neither of its own pre-added reactions counts towards anything -- the bot ignores reactions from any bot, including itself, so a stat only moves when a human on the committee clicks the emoji.
+- The bot records who clicked ✅ or 🗨, not just that someone did. That's what `/welcome pairs` reports.
 
+- The bot pre-adds ✅ and 🗨 to its own messages so Welcome Committee members don't have to search for the emoji. Neither of its own pre-added reactions counts towards anything -- the bot ignores reactions from any bot, including itself, so a stat only moves when a human clicks the emoji.
+
+
+## Who greeted whom
+
+`/welcome pairs` lists new members grouped by the committee member who greeted them, and it groups by **who clicked ✅**, not by who the rotation assigned.
+
+New members still waiting on a ✅ are listed separately at the bottom, with their assigned greeter in parentheses, so it's easy to see what's outstanding.
+
+Markers next to a newcomer's name: 🗨 they replied, 📝 they posted an intro. A `?` means that welcome was greeted before the bot started recording who clicked, so the name it's filed under is the assigned greeter rather than a confirmed clicker. Those only appear on welcomes from before this feature was added; nothing new gets a `?`.
+
+Pairings are read from the same records the stats come from, so anyone who was greeted before the bot was tracking clicks keeps their `?` permanently -- that information wasn't saved at the time and can't be recovered.
 
 ## Weekly summary
 
