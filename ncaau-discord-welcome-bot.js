@@ -233,7 +233,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
 
   const greeter = available[0];
   const msg =
-    `<@${greeter.id}>, you're up -- please reach out and say hello to <@${member.id}>. 🤝\n` +
+    `<@${greeter.id}>, you're up -- please say hello along with the events calendar screenshot in the General channel, and DM <@${member.id}>. 🤝\n` +
     (joinMsgUrl ? `🔗 ${joinMsgUrl}\n` : '') +
     `_React with ${REACHED_OUT} once you've reached out, and ${REPLIED} if they reply._`;
 
