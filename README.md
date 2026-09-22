@@ -6,6 +6,8 @@ When someone joins the NCAAU Discord server, the bot posts a message in the Welc
 
 Whose turn it is = whoever has waited longest since they were last assigned. Someone who has never been assigned counts as waiting the longest, so new committee members go to the front. Members who are snoozed are skipped entirely.
 
+Downtime recovery: If the bot is down when someone joins, that join is picked up the next time the bot starts.
+
 The bot reads the Welcome Committee role to find out who is on the committee.
 
 It optionally watches an introductions channel where new members might introduce themselves and notifies the newcomer's greeter about the introduction.
@@ -155,6 +157,28 @@ To test it without rebooting:
 
 - Task Scheduler --> left panel --> Task Scheduler Library --> Right-click the task --> Run
 
+## Downtime recovery
+
+A join only reaches the bot as a live event. If the bot is offline then anyone who joins during that window is never announced and never written to the data file.
+
+So every time the bot starts, before anything else it compares the server's member list (not the "someone joined" posts in the General channel) against welcome-data.json, and announces whatever it finds missing. Every member carries the exact timestamp of when they joined. The General channel is read only to recover the jump links for those joins.
+
+A recovery join is handled just like a live one -- next person in the rotation, same prompt, same ✅ and 🗨 reactions, same record -- with one extra line saying it was missed and how long ago the person joined.
+
+Before the batch, the bot posts one line saying how many it's catching up on. If there's nothing to catch up on -- the normal case -- it posts nothing at all and just notes it in the console.
+
+Notes on how it behaves:
+
+- It looks back 7 days. A join older than that is treated as water under the bridge and left alone.
+- It announces at most 10 at once (CATCHUP_MAX). That's a guard against welcome-data.json being lost or corrupted, which would otherwise make every recent member look un-greeted and flood the welcome channel. Over the limit, the most recent joins go out and the older ones are named in the header as held back; since they get no record, they come up again on the next restart, so the backlog drains rather than being dropped.
+- Anyone already in welcome-data.json is skipped, so restarting the bot doesn't re-announce anyone.
+- The match is on member ID *and* join time, so someone who left and rejoined during the downtime is intentionally treated as a new join and gets a fresh welcome rather than being mistaken for their older record. (That's intentional because they may not even recall having joined for a couple minutes.)
+- Someone who joined and then left again before the bot came back up is not announced. They're gone from the member list, so there's nobody to welcome.
+- The rotation is honoured by downtime recovery.
+- The posts are paced about a second apart to stay clear of Discord's rate limits.
+- It runs after the rest of startup, so a slow or failing recovery can't stop the bot coming online.
+- Caught-up records are flagged with `"catchUp": true` in welcome-data.json. Nothing in the stats treats them differently; it's there so it's clear why a welcome went out late.
+
 ## Watching the introductions channel
 
 When the bot posts a welcome prompt, it records the new member's user ID alongside that message. Then it watches the introductions channel for the first time that new member posts there, at which point it replies to its own original welcome prompt message in the Welcome Committee channel.
@@ -165,7 +189,7 @@ Notes on how it behaves:
 
 - Matching is by user ID, not by name, so a nickname or username change doesn't break it.
 - Only the first post is announced. Everything that member posts after that is ignored.
-- It only knows about people who joined while the bot was running -- a join is what creates the record. Someone who joined while the bot was down gets no announcement, because there's nothing to match against.
+- An intro posted during the downtime is missed because the bot only ever sees messages posted while it's running.
 - It ignores intro posts from anyone who joined more than 30 days ago, so a long-time member finally posting an intro doesn't set off a stale welcome.
 - The bot never posts in the introductions channel.
 - The channel is set by ID in the .env file, not by name, so renaming the channel doesn't break it either.

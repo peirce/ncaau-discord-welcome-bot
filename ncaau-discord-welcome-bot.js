@@ -14,6 +14,8 @@ const STATE_FILE  = './welcome-data.json';
 const WEEKLY_DAY  = 1;  // Weekly summary day: 0=Sun, 1=Mon ... 6=Sat
 const WEEKLY_HOUR = 9;  // Weekly summary hour (24h), in the HOST machine's local time
 const INTRO_DAYS  = 30; // Only announce an intro post from someone who joined within this many days
+const CATCHUP_DAYS = 7;  // On startup, look back this many days for joins missed while the bot was down (0 turns it off)
+const CATCHUP_MAX  = 10; // Announce at most this many missed joins at once, so a lost state file can't flood the channel
 // ----------------------------------------
 
 for (const [name, value] of Object.entries({ DISCORD_TOKEN: TOKEN, GUILD_ID, CHANNEL_ID, ROLE_ID })) {
@@ -27,7 +29,7 @@ const REACHED_OUT = '✅'; // U+2705
 const REPLIED     = '🗨'; // U+1F5E8 (FE0F variation selector stripped)
 const normalizeEmoji = (name) => (name ? name.replace(/\uFE0F/g, '') : name);
 
-// ---- persistent state ----
+// ---- Persistent state ----
 let data = { rotation: {}, welcomes: {}, snoozed: {}, lastWeekly: '' };
 try {
   const loaded = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
@@ -118,7 +120,7 @@ const client = new Client({
   partials: [Partials.Message, Partials.Reaction, Partials.User], // catch reactions on uncached msgs
 });
 
-// ---- slash command definitions ----
+// ---- Slash command definitions ----
 const welcomeCommand = new SlashCommandBuilder()
   .setName('welcome')
   .setDescription('Welcome Committee tools.')
@@ -168,9 +170,9 @@ const welcomeCommand = new SlashCommandBuilder()
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
+  let guild;
   try {
-    const guild = await c.guilds.fetch(GUILD_ID);
-
+    guild = await c.guilds.fetch(GUILD_ID);
     await guild.commands.set([welcomeCommand.toJSON()]);
     console.log('The welcome-bot is on duty. Use /welcome to see a list of commands.');
   } catch (e) {
@@ -179,6 +181,13 @@ client.once(Events.ClientReady, async (c) => {
   }
   maybePostWeekly();
   setInterval(maybePostWeekly, 15 * 60 * 1000); // re-check every 15 min
+
+  // The downtime recovery is last so it can't hold up the rest of startup.
+  try {
+    await catchUpOnMissedJoins(guild);
+  } catch (e) {
+    console.error('The welcome bot is operational, but a startup error occurred during downtime recovery which may prevent new members who joined during the downtime from being recognized, so please check manually for any recently missed joins:', e);
+  }
 });
 
 // Discord posts a "X joined the server" system message.
@@ -198,61 +207,184 @@ async function findJoinMessageUrl(guild, member) {
   return null;
 }
 
-// ---- someone joins ----
-client.on(Events.GuildMemberAdd, async (member) => {
-  if (member.user.bot) return;
-  const guild = member.guild;
+// Everyone currently holding the Welcome Committee role. The fetch fills the member cache, so the
+// role filter sees the whole server and not just whoever the bot happens to have seen recently.
+async function committeeMembers(guild) {
+  await guild.members.fetch();
+  return guild.members.cache.filter((m) => m.roles.cache.has(ROLE_ID) && !m.user.bot);
+}
 
-  const channel = await guild.channels.fetch(CHANNEL_ID).catch(() => null);
-  if (!channel || !channel.isTextBased()) {
-    console.error('ERROR: Could not identify the Welcome channel -- check CHANNEL_ID and permissions.');
-    return;
-  }
+function howLongAgo(ts) {
+  const mins = Math.max(1, Math.round((Date.now() - ts) / 60000));
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+}
 
-  const joinMsgUrl = await findJoinMessageUrl(guild, member);
-  await guild.members.fetch(); // populates cache so the role filter is complete
-  const committee = guild.members.cache.filter((m) => m.roles.cache.has(ROLE_ID) && !m.user.bot);
+// Assigns the next greeter, posts the prompt, and records the welcome.
+// This is used during live joins and downtime recovery.
+async function announceJoin(channel, member, committee, { joinedAt, joinMsgUrl, catchUp = false }) {
   const available = rotationOrder(committee); // excludes snoozed members
+  const lateNote = `⏳ Missed while the bot was offline -- they joined ${howLongAgo(joinedAt)}.`;
 
   if (available.length === 0) {
     const reason = committee.size === 0
       ? 'No one holds the Welcome Committee role right now'
       : 'All Welcome Committee members are currently snoozed';
+    const lines = [`👋 Welcome <@${member.id}>! (${reason} -- Someone please say hi.)`];
+    if (catchUp) lines.push(lateNote);
+    if (joinMsgUrl) lines.push(`🔗 ${joinMsgUrl}`);
     data.welcomes[`nc-${member.id}-${Date.now()}`] = {
       memberId: member.id, username: member.user.username,
-      joinedAt: Date.now(), greeterId: null, reachedOut: false, replied: false, noCommittee: true,
+      joinedAt, greeterId: null, reachedOut: false, replied: false, noCommittee: true,
+      ...(catchUp && { catchUp: true }),
     };
     saveData();
-    await channel.send({
-      content: `👋 Welcome <@${member.id}>! (${reason} -- someone please say hi.)` +
-        (joinMsgUrl ? `\n🔗 ${joinMsgUrl}` : ''),
-      allowedMentions: { users: [member.id] },
-    }).catch(() => {});
+    await channel.send({ content: lines.join('\n'), allowedMentions: { users: [member.id] } }).catch(() => {});
     return;
   }
 
   const greeter = available[0];
-  const msg =
-    `<@${greeter.id}>, you're up -- please say hello along with the events calendar screenshot in the General channel, and DM <@${member.id}>. 🤝\n` +
-    (joinMsgUrl ? `🔗 ${joinMsgUrl}\n` : '') +
-    `_React with ${REACHED_OUT} once you've reached out, and ${REPLIED} if they reply._`;
+  const lines = [
+    `<@${greeter.id}>, you're up -- please say hello along with the events calendar screenshot in the General channel, and DM <@${member.id}>. 🤝`,
+  ];
+  if (catchUp) lines.push(lateNote);
+  if (joinMsgUrl) lines.push(`🔗 ${joinMsgUrl}`);
+  lines.push(`_React with ${REACHED_OUT} once you've reached out, and ${REPLIED} if they reply._`);
 
+  const sent = await channel.send({
+    content: lines.join('\n'),
+    allowedMentions: { users: [member.id, greeter.id] },
+  });
+  data.rotation[greeter.id] = Date.now();
+  data.welcomes[sent.id] = {
+    memberId: member.id, username: member.user.username,
+    joinedAt, greeterId: greeter.id, reachedOut: false, replied: false,
+    ...(catchUp && { catchUp: true }),
+  };
+  saveData();
+  await sent.react('✅').catch(() => {});
+  await sent.react('🗨️').catch(() => {}); // qualified so Discord accepts it
+}
+
+// ---- Server join ----
+
+const joinsInFlight = new Set();
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  if (member.user.bot) return;
+  const guild = member.guild;
+
+  joinsInFlight.add(member.id);
   try {
-    const sent = await channel.send({ content: msg, allowedMentions: { users: [member.id, greeter.id] } });
-    data.rotation[greeter.id] = Date.now();
-    data.welcomes[sent.id] = {
-      memberId: member.id, username: member.user.username,
-      joinedAt: Date.now(), greeterId: greeter.id, reachedOut: false, replied: false,
-    };
-    saveData();
-    await sent.react('✅').catch(() => {});
-    await sent.react('🗨️').catch(() => {}); // qualified so Discord accepts it
+    const channel = await guild.channels.fetch(CHANNEL_ID).catch(() => null);
+    if (!channel || !channel.isTextBased()) {
+      console.error('ERROR: Could not identify the Welcome channel -- check CHANNEL_ID and permissions.');
+      return;
+    }
+
+    const joinMsgUrl = await findJoinMessageUrl(guild, member);
+    const committee = await committeeMembers(guild);
+    // Discord's own join time so the downtime recovery can match this record to the member later.
+    await announceJoin(channel, member, committee, {
+      joinedAt: member.joinedTimestamp ?? Date.now(),
+      joinMsgUrl,
+    });
   } catch (e) {
     console.error('ERROR: The welcome-bot failed to post a message: ', e);
+  } finally {
+    joinsInFlight.delete(member.id);
   }
 });
 
-// ---- reactions ----
+// ---- Downtime recovery ----
+
+// A join counts as already handled if there's a record for that member near the same join time.
+// Comparing times along with IDs means someone who left and rejoined correctly gets a fresh welcome 
+// instead of being mistaken for their older record.
+const SAME_JOIN_MS = 10 * 60 * 1000;
+function alreadyRecorded(memberId, joinedAt) {
+  return Object.values(data.welcomes)
+    .some((r) => r.memberId === memberId && Math.abs(r.joinedAt - joinedAt) < SAME_JOIN_MS);
+}
+
+// Maps user ID to the URL of their "joined the server" post.
+// An empty map just means the downtime recovery prompts go out without their jump links.
+async function recentJoinMessageUrls(guild, since) {
+  const urls = new Map();
+  if (guild.systemChannelFlags.has(SystemChannelFlagsBitField.Flags.SuppressJoinNotifications)) return urls;
+  const sysChannel = guild.systemChannel;
+  if (!sysChannel) return urls;
+
+  let before;
+  for (let page = 0; page < 5; page++) { // 5 x 100 messages is far more than a week of General
+    const batch = await sysChannel.messages.fetch({ limit: 100, ...(before && { before }) }).catch(() => null);
+    if (!batch?.size) break;
+    for (const m of batch.values()) {
+      if (m.type === MessageType.UserJoin && !urls.has(m.author.id)) urls.set(m.author.id, m.url);
+    }
+    const oldest = batch.last();
+    if (oldest.createdTimestamp < since) break; // walked back past the window
+    before = oldest.id;
+  }
+  return urls;
+}
+
+async function catchUpOnMissedJoins(guild) {
+  if (!CATCHUP_DAYS) return;
+
+  const channel = await guild.channels.fetch(CHANNEL_ID).catch(() => null);
+  if (!channel || !channel.isTextBased()) {
+    console.error('Downtime recovery skipped: Could not identify the Welcome channel -- check CHANNEL_ID and permissions.');
+    return;
+  }
+
+  const since = Date.now() - CATCHUP_DAYS * 86400000;
+  const committee = await committeeMembers(guild); // also fills the member cache read just below
+  let queue = [...guild.members.cache.values()]
+    .filter((m) => !m.user.bot && !joinsInFlight.has(m.id)
+      && m.joinedTimestamp >= since && !alreadyRecorded(m.id, m.joinedTimestamp))
+    .sort((a, b) => a.joinedTimestamp - b.joinedTimestamp); // oldest first, so the rotation advances in join order
+
+  if (queue.length === 0) {
+    console.log(`Startup / Downtime recovery: nothing missed in the last ${CATCHUP_DAYS} days.`);
+    return;
+  }
+
+  const total = queue.length;
+  const held = queue.slice(0, Math.max(0, total - CATCHUP_MAX)).map((m) => m.user.username);
+  queue = queue.slice(-CATCHUP_MAX);
+
+  const header = [
+    `🔄 **Downtime recovery** -- ${total} join${total === 1 ? '' : 's'} from the last ${CATCHUP_DAYS} days went unannounced while the bot was offline.` +
+      (held.length ? ` Posting the ${queue.length} most recent:` : ''),
+  ];
+  if (held.length) {
+    header.push(`_Held back for now (over the ${CATCHUP_MAX}-at-a-time limit; they come up on the next restart): ${held.join(', ')}._`);
+  }
+  await channel.send({ content: header.join('\n'), allowedMentions: { parse: [] } }).catch(() => {});
+
+  const joinUrls = await recentJoinMessageUrls(guild, since);
+  let posted = 0;
+  for (const member of queue) {
+    try {
+      await announceJoin(channel, member, committee, {
+        joinedAt: member.joinedTimestamp,
+        joinMsgUrl: joinUrls.get(member.id) ?? null,
+        catchUp: true,
+      });
+      posted++;
+    } catch (e) {
+      console.error(`Downtime recovery: Failed to announce ${member.user.username}:`, e);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1200)); // paced to stay clear of rate limits
+  }
+  console.log(`Downtime recovery: Announced ${posted} of ${total} missed join(s).`);
+}
+
+// ---- Emoji reactions ----
 // Each mark records WHO clicked, not just that someone did. 
 //   rec.greeterId is who the rotation assigned to welcome.
 //   reachedOutBy is who said they welcomed (by checkmarking).
@@ -261,12 +393,14 @@ client.on(Events.GuildMemberAdd, async (member) => {
 // Credit goes to the first person to click. Every click is also kept, in order, so that if
 // the credited person removes their mark (correcting a mis-click) then credit can pass to the next one.
 // repliedConfirmedBy is whomever reported the newcomer's reply.
+
 const MARKS = {
   [REACHED_OUT]: { flag: 'reachedOut', by: 'reachedOutBy',       at: 'reachedOutAt', clicks: 'reachedOutClicks' },
   [REPLIED]:     { flag: 'replied',    by: 'repliedConfirmedBy', at: 'repliedAt',    clicks: 'repliedClicks' },
 };
 
-// ---- a reaction lands ----
+// ---- Reaction arrival ----
+
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
   if (user.bot) return;
   if (reaction.partial) { try { await reaction.fetch(); } catch { return; } }
@@ -289,7 +423,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
   saveData();
 });
 
-// ---- a reaction is removed ----
+// ---- Reaction removal ----
 // If the credited member takes their mark back, credit passes to the earliest click the bot saw that's
 // still on the message. Failing that, to anyone still showing the mark (e.g. they clicked
 // while the bot was offline, so there's no click order to go by). Elsewise, the mark is cleared,
@@ -336,10 +470,10 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
   saveData();
 });
 
-// ---- a newcomer posts in 👋-introductions ----
+// ---- A newcomer posts in 👋-introductions ----
 // Matching is by user ID (from the record written at join time), not by name, so nickname
 // changes and duplicate usernames can't fool it. Only the FIRST post is announced.
-const introPending = new Set(); // guards against a double post if two messages land at once
+const introPending = new Set(); // guards against a double post if two messages arrive at once
 
 client.on(Events.MessageCreate, async (message) => {
   if (!INTRO_ID || message.channelId !== INTRO_ID) return;
@@ -388,7 +522,7 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
-// ---- slash commands ----
+// ---- Slash commands ----
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'welcome') return;
 
@@ -561,7 +695,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// ---- weekly summary ----
+// ---- Weekly summary ----
 async function maybePostWeekly() {
   const now = new Date();
   if (now.getDay() !== WEEKLY_DAY || now.getHours() < WEEKLY_HOUR) return;
