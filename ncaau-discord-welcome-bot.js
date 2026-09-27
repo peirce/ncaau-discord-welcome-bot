@@ -29,6 +29,11 @@ const REACHED_OUT = '✅'; // U+2705
 const REPLIED     = '🗨'; // U+1F5E8 (FE0F variation selector stripped)
 const normalizeEmoji = (name) => (name ? name.replace(/\uFE0F/g, '') : name);
 
+// The emojis the bot pre-adds to each prompt.
+// Discord refuses to add an unqualified emoji as a reaction, 
+// hence putting back the variation selector \uFE0F for REPLIED.
+const PREADD = [REACHED_OUT, `${REPLIED}\uFE0F`];
+
 // ---- Persistent state ----
 let data = { rotation: {}, welcomes: {}, snoozed: {}, lastWeekly: '' };
 try {
@@ -39,11 +44,14 @@ try {
     snoozed: loaded.snoozed ?? {},
     lastWeekly: loaded.lastWeekly ?? '',
   };
-  // Older state files called this onDutyId. Carry it over so past welcomes keep their greeter.
+
+  const RENAMED = { onDutyId: 'greeterId', memberId: 'newbieId', username: 'newbieName' };
   for (const rec of Object.values(data.welcomes)) {
-    if (rec.greeterId === undefined && 'onDutyId' in rec) {
-      rec.greeterId = rec.onDutyId;
-      delete rec.onDutyId;
+    for (const [was, now] of Object.entries(RENAMED)) {
+      if (rec[now] === undefined && was in rec) {
+        rec[now] = rec[was];
+        delete rec[was];
+      }
     }
   }
 } catch {
@@ -237,7 +245,7 @@ async function announceJoin(channel, member, committee, { joinedAt, joinMsgUrl, 
     if (catchUp) lines.push(lateNote);
     if (joinMsgUrl) lines.push(`🔗 ${joinMsgUrl}`);
     data.welcomes[`nc-${member.id}-${Date.now()}`] = {
-      memberId: member.id, username: member.user.username,
+      newbieId: member.id, newbieName: member.user.username,
       joinedAt, greeterId: null, reachedOut: false, replied: false, noCommittee: true,
       ...(catchUp && { catchUp: true }),
     };
@@ -260,13 +268,12 @@ async function announceJoin(channel, member, committee, { joinedAt, joinMsgUrl, 
   });
   data.rotation[greeter.id] = Date.now();
   data.welcomes[sent.id] = {
-    memberId: member.id, username: member.user.username,
+    newbieId: member.id, newbieName: member.user.username,
     joinedAt, greeterId: greeter.id, reachedOut: false, replied: false,
     ...(catchUp && { catchUp: true }),
   };
   saveData();
-  await sent.react('✅').catch(() => {});
-  await sent.react('🗨️').catch(() => {}); // qualified so Discord accepts it
+  for (const emoji of PREADD) await sent.react(emoji).catch(() => {});
 }
 
 // ---- Server join ----
@@ -305,9 +312,9 @@ client.on(Events.GuildMemberAdd, async (member) => {
 // Comparing times along with IDs means someone who left and rejoined correctly gets a fresh welcome 
 // instead of being mistaken for their older record.
 const SAME_JOIN_MS = 10 * 60 * 1000;
-function alreadyRecorded(memberId, joinedAt) {
+function alreadyRecorded(newbieId, joinedAt) {
   return Object.values(data.welcomes)
-    .some((r) => r.memberId === memberId && Math.abs(r.joinedAt - joinedAt) < SAME_JOIN_MS);
+    .some((r) => r.newbieId === newbieId && Math.abs(r.joinedAt - joinedAt) < SAME_JOIN_MS);
 }
 
 // Maps user ID to the URL of their "joined the server" post.
@@ -399,6 +406,13 @@ const MARKS = {
   [REPLIED]:     { flag: 'replied',    by: 'repliedConfirmedBy', at: 'repliedAt',    clicks: 'repliedClicks' },
 };
 
+// The introductions message notifies whomever hit ✅, not the originally assigned greeter.
+// Returns null for a join that occurred while no one held the welcome committee role.
+function currentGreeterId(rec) {
+  if (rec.reachedOut && rec.reachedOutBy) return rec.reachedOutBy;
+  return rec.greeterId ?? null;
+}
+
 // ---- Reaction arrival ----
 
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
@@ -482,7 +496,7 @@ client.on(Events.MessageCreate, async (message) => {
 
   const cutoff = Date.now() - INTRO_DAYS * 86400000;
   const records = Object.entries(data.welcomes)
-    .filter(([, r]) => r.memberId === message.author.id && r.joinedAt >= cutoff)
+    .filter(([, r]) => r.newbieId === message.author.id && r.joinedAt >= cutoff)
     .sort((a, b) => b[1].joinedAt - a[1].joinedAt); // newest join first
   if (records.length === 0) return;                          // not a tracked newcomer
   if (records.some(([, r]) => r.introPostedAt)) return;      // already announced (covers rejoins)
@@ -496,15 +510,13 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     const [promptId, rec] = records[0];
-    // rec.greeterId is whoever was assigned to THIS newcomer back at join time -- not whoever is
-    // next in the rotation now. The rotation may have turned over many times since.
-    const lead = rec.greeterId ? `<@${rec.greeterId}>, in case` : 'In case';
+    const greeterId = currentGreeterId(rec);
+    const lead = greeterId ? `<@${greeterId}>, in case` : 'In case';
     // Discord renders message.url as "#channel > 🗨".
     const content =
-      `📝 ${lead} you'd like to respond or react with an emoji, <@${rec.memberId}> posted in ${message.url}`;
-    const allowedMentions = { users: rec.greeterId ? [rec.greeterId] : [] }; // ping their greeter, not the newcomer
+      `📝 ${lead} you'd like to respond or react with an emoji, <@${rec.newbieId}> posted in ${message.url}`;
+    const allowedMentions = { users: greeterId ? [greeterId] : [] };
 
-    // Reply to the original welcome prompt so the committee sees it in context.
     // Keys starting with "nc-" are joins that had no prompt message to reply to.
     const prompt = promptId.startsWith('nc-')
       ? null
@@ -512,7 +524,6 @@ client.on(Events.MessageCreate, async (message) => {
     if (prompt) await prompt.reply({ content, allowedMentions });
     else await channel.send({ content, allowedMentions });
 
-    // Recorded on its own, with no emoji involved. 🗨 stays a manual "they replied to me" signal.
     rec.introPostedAt = Date.now();
     saveData();
   } catch (e) {
@@ -639,13 +650,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // Falls back to a silenced mention for anyone who has since left the server.
     const nameOf = (id) => guild.members.cache.get(id)?.displayName ?? `<@${id}>`;
 
-    // Grouped by who clicked ✅, which is the real pairing -- not necessarily who the rotation assigned.
+    // Grouped by who clicked ✅ not necessarily who the rotation assigned.
+    // Until someone clicks ✅ there's no one to group by, so the welcome is listed as pending
+    // under the greeter the rotation assigned.
     const byGreeter = new Map();
     const pending = [];
     let anyLegacy = false;
     let anyHandover = false;
     for (const rec of records) {
-      const id = rec.reachedOut ? (rec.reachedOutBy ?? rec.greeterId) : null;
+      const id = rec.reachedOut ? currentGreeterId(rec) : null;
       if (!id) { pending.push(rec); continue; }
       if (!byGreeter.has(id)) byGreeter.set(id, []);
       byGreeter.get(id).push(rec);
@@ -662,7 +675,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           marks.push(`(assigned to ${nameOf(rec.greeterId)})`);
           anyHandover = true;
         }
-        return marks.length ? `${rec.username} ${marks.join(' ')}` : rec.username;
+        return marks.length ? `${rec.newbieName} ${marks.join(' ')}` : rec.newbieName;
       });
       lines.push(`${REACHED_OUT} **${nameOf(id)}** (${recs.length}): ${names.join(', ')}`);
     }
@@ -670,10 +683,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (pending.length) {
       lines.push('');
       lines.push(`⏳ **Awaiting a ${REACHED_OUT}:** ` + pending
-        .map((rec) => `${rec.username} (${rec.greeterId ? nameOf(rec.greeterId) : 'unassigned'})`)
+        .map((rec) => `${rec.newbieName} (${rec.greeterId ? nameOf(rec.greeterId) : 'unassigned'})`)
         .join(', '));
     }
 
+    // Legend line at the bottom of /welcome pairs:
     const legend = [`${REPLIED} replied`];
     if (INTRO_ID) legend.push('📝 posted an intro');
     if (anyHandover) legend.push('a name in parentheses is who the rotation had assigned');

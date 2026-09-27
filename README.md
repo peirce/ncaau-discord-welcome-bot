@@ -173,7 +173,7 @@ Notes on how it behaves:
 - It announces at most 10 at once (CATCHUP_MAX). That's a guard against welcome-data.json being lost or corrupted, which would otherwise make every recent member look un-greeted and flood the welcome channel. Over the limit, the most recent joins go out and the older ones are named in the header as held back; since they get no record, they come up again on the next restart, so the backlog drains rather than being dropped.
 - Anyone already in welcome-data.json is skipped, so restarting the bot doesn't re-announce anyone.
 - The match is on member ID *and* join time, so someone who left and rejoined during the downtime is intentionally treated as a new join and gets a fresh welcome rather than being mistaken for their older record. (That's intentional because they may not even recall having joined for a couple minutes.)
-- Someone who joined and then left again before the bot came back up is not announced. They're gone from the member list, so there's nobody to welcome.
+- Someone who joined and then left again before the bot came back up is not announced. They're gone from the member list, so there's no one to welcome.
 - The rotation is honoured by downtime recovery.
 - The posts are paced about a second apart to stay clear of Discord's rate limits.
 - It runs after the rest of startup, so a slow or failing recovery can't stop the bot coming online.
@@ -188,6 +188,7 @@ The point is so the greeter is aware someone they greeted has introduced themsel
 Notes on how it behaves:
 
 - Matching is by user ID, not by name, so a nickname or username change doesn't break it.
+- The ping goes to whomever clicked ✅ on that welcome, because that is who actually greeted them -- not necessarily the greeter the rotation assigned, which often is not the same person. If no one has clicked ✅ yet, it goes to the assigned greeter.
 - Only the first post is announced. Everything that member posts after that is ignored.
 - An intro posted during the downtime is missed because the bot only ever sees messages posted while it's running.
 - It ignores intro posts from anyone who joined more than 30 days ago, so a long-time member finally posting an intro doesn't set off a stale welcome.
@@ -222,13 +223,13 @@ How emoji reactions get counted:
 
 New members still waiting on a ✅ are listed separately at the bottom, with their assigned greeter in parentheses, so it's easy to see what's outstanding.
 
-Markers next to a newcomer's name: 🗨 they replied, 📝 they posted an intro. A `?` means that welcome was greeted before the bot started recording who clicked, so the name it's filed under is the assigned greeter rather than a confirmed clicker. Those only appear on welcomes from before this feature was added; nothing new gets a `?`.
+Markers next to a newcomer's name: 🗨 they replied, 📝 they posted an intro. A name in parentheses is who the rotation had assigned, shown when that isn't who got the credit. A `?` means that welcome was greeted before the bot started recording who clicked, so the name it's filed under is the assigned greeter rather than a confirmed clicker. Those only appear on welcomes from before this feature was added; nothing new gets a `?`.
 
 Pairings are read from the same records the stats come from, so anyone who was greeted before the bot was tracking clicks keeps their `?` permanently -- that information wasn't saved at the time and can't be recovered.
 
 ## Weekly summary
 
-Once a week the bot posts a summary of the last 7 days to the Welcome Committee channel, in the same format as `/welcome stats`. Nobody has to trigger it.
+Once a week the bot posts a summary of the last 7 days to the Welcome Committee channel, in the same format as `/welcome stats`. No one has to trigger it.
 
 By default it posts Mondays at 9am, in the local time of the machine running the bot -- not in any Discord member's own timezone. If the bot isn't running at that moment it posts the next time it is running later that same day; if it's down all day it skips that week. It posts at most once a day.
 
