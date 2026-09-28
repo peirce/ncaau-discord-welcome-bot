@@ -182,7 +182,7 @@ client.once(Events.ClientReady, async (c) => {
   try {
     guild = await c.guilds.fetch(GUILD_ID);
     await guild.commands.set([welcomeCommand.toJSON()]);
-    console.log('The welcome-bot is on duty. Use /welcome to see a list of commands.');
+    console.log('The welcome-bot is on duty. Use /welcome in Discord to see a list of commands.');
   } catch (e) {
     console.error('ERROR during startup -- check GUILD_ID and bot permissions:', e);
     process.exit(1);
@@ -235,14 +235,14 @@ function howLongAgo(ts) {
 // This is used during live joins and downtime recovery.
 async function announceJoin(channel, member, committee, { joinedAt, joinMsgUrl, catchUp = false }) {
   const available = rotationOrder(committee); // excludes snoozed members
-  const lateNote = `⏳ Missed while the bot was offline -- they joined ${howLongAgo(joinedAt)}.`;
+  const catchupNote = `⏳ Missed while the bot was offline -- they joined ${howLongAgo(joinedAt)}.`;
 
   if (available.length === 0) {
     const reason = committee.size === 0
       ? 'No one holds the Welcome Committee role right now'
       : 'All Welcome Committee members are currently snoozed';
     const lines = [`👋 Welcome <@${member.id}>! (${reason} -- Someone please say hi.)`];
-    if (catchUp) lines.push(lateNote);
+    if (catchUp) lines.push(catchupNote);
     if (joinMsgUrl) lines.push(`🔗 ${joinMsgUrl}`);
     data.welcomes[`nc-${member.id}-${Date.now()}`] = {
       newbieId: member.id, newbieName: member.user.username,
@@ -256,9 +256,9 @@ async function announceJoin(channel, member, committee, { joinedAt, joinMsgUrl, 
 
   const greeter = available[0];
   const lines = [
-    `<@${greeter.id}>, you're up -- please say hello along with the events calendar screenshot in the General channel, and DM <@${member.id}>. 🤝`,
+    `<@${greeter.id}>, you're up -- please say hello to DM <@${member.id}> along with the events calendar screenshot and a link to the welcome video (but remove the embed).`,
   ];
-  if (catchUp) lines.push(lateNote);
+  if (catchUp) lines.push(catchupNote);
   if (joinMsgUrl) lines.push(`🔗 ${joinMsgUrl}`);
   lines.push(`_React with ${REACHED_OUT} once you've reached out, and ${REPLIED} if they reply._`);
 
