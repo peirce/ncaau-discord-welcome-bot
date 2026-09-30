@@ -13,7 +13,8 @@ const INTRO_ID    = process.env.INTRO_CHANNEL_ID; // 👋-introductions CHANNEL 
 const STATE_FILE  = './welcome-data.json';
 const WEEKLY_DAY  = 1;  // Weekly summary day: 0=Sun, 1=Mon ... 6=Sat
 const WEEKLY_HOUR = 9;  // Weekly summary hour (24h), in the HOST machine's local time
-const INTRO_DAYS  = 30; // Only announce an intro post from someone who joined within this many days
+const INTRO_DAYS  = 30; // Only announce an intro post (or first post elsewhere) from someone who joined within this many days
+const ANNOUNCE_OTHER_POSTS = true; // Notify the greeter of a newcomer's first post outside 👋-introductions (false = count it in stats only)
 const CATCHUP_DAYS = 7;  // On startup, look back this many days for joins missed while the bot was down (0 turns it off)
 const CATCHUP_MAX  = 10; // Announce at most this many missed joins at once, so a lost state file can't flood the channel
 // ----------------------------------------
@@ -25,8 +26,10 @@ for (const [name, value] of Object.entries({ DISCORD_TOKEN: TOKEN, GUILD_ID, CHA
   }
 }
 
-const REACHED_OUT = '✅'; // U+2705
-const REPLIED     = '🗨'; // U+1F5E8 (FE0F variation selector stripped)
+const REACHED_OUT      = '✅'; // U+2705
+const REPLIED          = '🗨'; // U+1F5E8 (FE0F variation selector stripped) -- DM replies only
+const POSTED_INTRO     = '👋'; // posted in 👋-introductions (tracked by the bot, no reaction)
+const POSTED_ELSEWHERE = '✍️'; // posted in any other channel (tracked by the bot, no reaction); FE0F makes it display as an emoji
 const normalizeEmoji = (name) => (name ? name.replace(/\uFE0F/g, '') : name);
 
 // The emojis the bot pre-adds to each prompt.
@@ -104,16 +107,18 @@ function buildStatsText(days, title) {
   const reached = records.filter((r) => r.reachedOut).length;
   const replied = records.filter((r) => r.replied).length;
   const intros  = records.filter((r) => r.introPostedAt).length;
+  const others  = records.filter((r) => r.otherPostedAt).length;
   const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
   const lines = [
     RULE,
     title,
     `New joins: ${joins}`,
     `✅ Reached out: ${reached} (${pct(reached, joins)}% of joins)`,
-    `🗨 Replied: ${replied} (${pct(replied, joins)}% of joins · ${pct(replied, reached)}% of those contacted)`,
+    `🗨 Replied by DM: ${replied} (${pct(replied, joins)}% of joins · ${pct(replied, reached)}% of those contacted)`,
   ];
   // Counted by the bot itself, not from reactions -- so it's only shown when the watch is on.
-  if (INTRO_ID) lines.push(`📝 Posted an intro: ${intros} (${pct(intros, joins)}% of joins)`);
+  if (INTRO_ID) lines.push(`${POSTED_INTRO} Posted an intro: ${intros} (${pct(intros, joins)}% of joins)`);
+  lines.push(`${POSTED_ELSEWHERE} Posted in another channel: ${others} (${pct(others, joins)}% of joins)`);
   lines.push(RULE);
   return lines.join('\n');
 }
@@ -123,7 +128,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,          // privileged -- toggle ON in the Dev Portal
     GatewayIntentBits.GuildMessageReactions, // standard -- no portal toggle
-    GatewayIntentBits.GuildMessages,         // standard -- needed to see posts in 👋-introductions
+    GatewayIntentBits.GuildMessages,         // standard -- needed to see newcomers' posts in 👋-introductions and elsewhere
   ],
   partials: [Partials.Message, Partials.Reaction, Partials.User], // catch reactions on uncached msgs
 });
@@ -170,7 +175,7 @@ const welcomeCommand = new SlashCommandBuilder()
   )
   .addSubcommand((sub) =>
     sub.setName('stats')
-      .setDescription('Shows join count, reach-out rate, reply rate, and intro-post rate for the last 30 days.')
+      .setDescription('Shows joins, reach-outs, DM replies, intro posts, and posts elsewhere for the last 30 days.')
       .addIntegerOption((opt) =>
         opt.setName('days').setDescription('Or for the last now many days? (Default is 30.)').setMinValue(1)
       )
@@ -182,7 +187,8 @@ client.once(Events.ClientReady, async (c) => {
   try {
     guild = await c.guilds.fetch(GUILD_ID);
     await guild.commands.set([welcomeCommand.toJSON()]);
-    console.log('The welcome-bot is on duty. Use /welcome in Discord to see a list of commands.');
+    console.log('The welcome-bot is on duty.');
+    console.log('To see a list of commands, use /welcome in Discord.');
   } catch (e) {
     console.error('ERROR during startup -- check GUILD_ID and bot permissions:', e);
     process.exit(1);
@@ -260,7 +266,7 @@ async function announceJoin(channel, member, committee, { joinedAt, joinMsgUrl, 
   ];
   if (catchUp) lines.push(catchupNote);
   if (joinMsgUrl) lines.push(`🔗 ${joinMsgUrl}`);
-  lines.push(`_React with ${REACHED_OUT} once you've reached out, and ${REPLIED} if they reply._`);
+  lines.push(`_React with ${REACHED_OUT} once you've reached out, and ${REPLIED} if they reply to your DM. (The bot records their posts in the server's channels separately and automatically.)_`);
 
   const sent = await channel.send({
     content: lines.join('\n'),
@@ -356,7 +362,7 @@ async function catchUpOnMissedJoins(guild) {
     .sort((a, b) => a.joinedTimestamp - b.joinedTimestamp); // oldest first, so the rotation advances in join order
 
   if (queue.length === 0) {
-    console.log(`Startup / Downtime recovery: nothing missed in the last ${CATCHUP_DAYS} days.`);
+    console.log(`Downtime recovery: Nothing missed in the last ${CATCHUP_DAYS} days.`);
     return;
   }
 
@@ -484,24 +490,46 @@ client.on(Events.MessageReactionRemove, async (reaction, user) => {
   saveData();
 });
 
-// ---- A newcomer posts in 👋-introductions ----
-// Matching is by user ID (from the record written at join time), not by name, so nickname
-// changes and duplicate usernames can't fool it. Only the FIRST post is announced.
-const introPending = new Set(); // guards against a double post if two messages arrive at once
+// ---- A newcomer posts in the server ----
+// First post in 👋-introductions and first post in any other channel.
+const POST_KINDS = {
+  intro: { at: 'introPostedAt', mark: POSTED_INTRO,     announce: true,                 label: 'an intro post' },
+  other: { at: 'otherPostedAt', mark: POSTED_ELSEWHERE, announce: ANNOUNCE_OTHER_POSTS, label: 'a non-intro post' },
+};
+const postPending = new Set(); // "kind:userId" -- guards against a double post if two messages arrive at once
+
+function postKind(message) {
+  const channelId = message.channelId;
+  const parentId = message.channel?.parentId; // a thread's parent channel (or a channel's category)
+  if (INTRO_ID && channelId === INTRO_ID) return 'intro';
+  if (INTRO_ID && parentId === INTRO_ID) return null; // a thread off someone's intro counts as neither
+  return 'other';
+}
 
 client.on(Events.MessageCreate, async (message) => {
-  if (!INTRO_ID || message.channelId !== INTRO_ID) return;
-  if (message.author.bot) return;
-  if (introPending.has(message.author.id)) return;
+  if (message.guildId !== GUILD_ID) return;
+  if (message.author.bot || message.system) return; // system = e.g. their own "joined the server" message
+  const kindName = postKind(message);
+  if (!kindName) return;
+  const kind = POST_KINDS[kindName];
+  const pendingKey = `${kindName}:${message.author.id}`;
+  if (postPending.has(pendingKey)) return;
 
   const cutoff = Date.now() - INTRO_DAYS * 86400000;
   const records = Object.entries(data.welcomes)
     .filter(([, r]) => r.newbieId === message.author.id && r.joinedAt >= cutoff)
     .sort((a, b) => b[1].joinedAt - a[1].joinedAt); // newest join first
-  if (records.length === 0) return;                          // not a tracked newcomer
-  if (records.some(([, r]) => r.introPostedAt)) return;      // already announced (covers rejoins)
+  if (records.length === 0) return;                 // not a tracked newcomer
+  if (records.some(([, r]) => r[kind.at])) return;  // already recorded (covers rejoins)
 
-  introPending.add(message.author.id);
+  const [promptId, rec] = records[0];
+  if (!kind.announce) {
+    rec[kind.at] = Date.now();
+    saveData();
+    return;
+  }
+
+  postPending.add(pendingKey);
   try {
     const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
     if (!channel || !channel.isTextBased()) {
@@ -509,12 +537,11 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    const [promptId, rec] = records[0];
     const greeterId = currentGreeterId(rec);
     const lead = greeterId ? `<@${greeterId}>, in case` : 'In case';
     // Discord renders message.url as "#channel > 🗨".
     const content =
-      `📝 ${lead} you'd like to respond or react with an emoji, <@${rec.newbieId}> posted in ${message.url}`;
+      `${kind.mark} ${lead} you'd like to respond or react with an emoji, <@${rec.newbieId}> posted in ${message.url}`;
     const allowedMentions = { users: greeterId ? [greeterId] : [] };
 
     // Keys starting with "nc-" are joins that had no prompt message to reply to.
@@ -524,12 +551,12 @@ client.on(Events.MessageCreate, async (message) => {
     if (prompt) await prompt.reply({ content, allowedMentions });
     else await channel.send({ content, allowedMentions });
 
-    rec.introPostedAt = Date.now();
+    rec[kind.at] = Date.now();
     saveData();
   } catch (e) {
-    console.error('ERROR: The welcome-bot failed to announce an intro post: ', e);
+    console.error(`ERROR: The welcome-bot failed to announce ${kind.label}: `, e);
   } finally {
-    introPending.delete(message.author.id);
+    postPending.delete(pendingKey);
   }
 });
 
@@ -669,7 +696,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const names = recs.map((rec) => {
         const marks = [];
         if (rec.replied) marks.push(REPLIED);
-        if (rec.introPostedAt) marks.push('📝');
+        if (rec.introPostedAt) marks.push(POSTED_INTRO);
+        if (rec.otherPostedAt) marks.push(POSTED_ELSEWHERE);
         if (!rec.reachedOutBy) { marks.push('?'); anyLegacy = true; }
         else if (rec.greeterId && rec.reachedOutBy !== rec.greeterId) {
           marks.push(`(assigned to ${nameOf(rec.greeterId)})`);
@@ -688,8 +716,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     // Legend line at the bottom of /welcome pairs:
-    const legend = [`${REPLIED} replied`];
-    if (INTRO_ID) legend.push('📝 posted an intro');
+    const legend = [`${REPLIED} replied by DM`];
+    if (INTRO_ID) legend.push(`${POSTED_INTRO} posted an intro`);
+    legend.push(`${POSTED_ELSEWHERE} posted in another channel`);
     if (anyHandover) legend.push('a name in parentheses is who the rotation had assigned');
     if (anyLegacy) legend.push('? = greeted before the bot recorded who clicked');
     lines.push('');

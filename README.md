@@ -14,7 +14,7 @@ It optionally watches an introductions channel where new members might introduce
 
 It also records which committee member greeted which new member, taken from whoever clicked ✅ -- see `/welcome pairs`.
 
-It also keeps some basic stats: how many people joined, how many got greeted, how many replied, and how many posted an introduction. Joins and intro posts are tracked by the bot on its own; Greetings and replies come from the ✅ and 🗨 emoji reactions. The bot auto-posts a weekly summary to the Welcome Committee channel, and stats on demand with a customizable timespan.
+It also keeps some basic stats: how many people joined, how many got greeted, how many replied to their greeter's DM, how many posted an introduction, and how many posted in any other channel. Joins and posts are tracked by the bot on its own; Greetings and DM replies come from the ✅ and 🗨 emoji reactions. The bot auto-posts a weekly summary to the Welcome Committee channel, and stats on demand with a customizable timespan.
 
 ## The bot's slash commands
 
@@ -31,7 +31,7 @@ While the bot is running, Welcome Committee members can use these slash commands
 | `/welcome snooze USER DATE` | Committee | Pauses someone from the rotation until DATE (YYYY-MM-DD). |
 | `/welcome snooze USER` | Committee | Pauses someone from the rotation indefinitely, with no return date, until someone unsnoozes them. |
 | `/welcome unsnooze USER` | Committee | Cancels the snooze early: Returns someone to the rotation. |
-| `/welcome stats` | Anyone | Shows join count, reach-out rate, reply rate, and intro-post rate for the last 30 days. |
+| `/welcome stats` | Anyone | Shows joins, reach-outs, DM replies, intro posts, and posts in other channels for the last 30 days. |
 | `/welcome stats DAYS` | Anyone | Shows the same stats for the last DAYS days. |
 
 Discord still lists every command for everyone, so a non-committee member who tries a restricted one gets a private "committee members only" reply that nobody else in the channel sees.
@@ -196,15 +196,26 @@ Notes on how it behaves:
 - The channel is set by ID in the .env file, not by name, so renaming the channel doesn't break it either.
 - This assumes the introductions channel is public. The bot sees it the same way any member does, through @everyone, so nothing has to be granted to the bot specifically. If that channel is ever made private, the bot silently stops seeing posts in it -- no error, no log, announcements just quietly stop -- until the bot is given permission to view the channel.
 
+## Watching the other channels
+
+The same occurs for a newcomer's first post in any channel besides introductions that the bot can see. It's recorded as its own stat (✍️), and the greeter gets a ✍️ reply on the original welcome prompt with a link to the non-intro post.
+
+- It's tracked separately from the intro post, so a newcomer who posts in both gets both a 👋 and a ✍️.
+- Discord's automatic "joined the server" message doesn't count.
+- Same 30-day window, first-post-only, and missed-during-downtime rules as the intro watch.
+- To keep the stat but stop the ✍️ pings, set `ANNOUNCE_OTHER_POSTS = false` near the top of the .js file.
+
 ## Stats & Emojis
 
 Stats are only as good as the emoji reactions Welcome Committee members add to the bot's messages:
 
 ✅  React with this emoji once you've reached out to the new member.
 
-🗨  React with this emoji if the new member replies to you.
+🗨  React with this emoji if the new member replies to your DM. This stat is for DM replies only -- posts in the server's channels are tracked automatically (below).
 
-📝  No emoji reaction is needed for this one. Intro posts are tracked automatically, counted by the bot in its own stats -- see the section above. Don't click 🗨 for an intro post; the two are tracked separately on purpose, so you can see how many newcomers posted in 👋-introductions versus how many answered a greeting.
+👋  No emoji reaction is needed for this one. The bot automatically counts intro posts -- see the section above. Don't click 🗨 for an intro post; the two are tracked separately on purpose, so you can see how many newcomers posted in 👋-introductions versus how many answered a greeting.
+
+✍️  No emoji reaction is needed for this one. The bot automatically counts a newcomer's first post in any other channel.
 
 How emoji reactions get counted:
 
@@ -219,11 +230,11 @@ How emoji reactions get counted:
 
 ## Who greeted whom
 
-`/welcome pairs` lists new members grouped by the committee member who greeted them, and it groups by **who clicked ✅**, not by who the rotation assigned.
+`/welcome pairs` lists the pairs of new members and the greeter who clicked ✅.
 
 New members still waiting on a ✅ are listed separately at the bottom, with their assigned greeter in parentheses, so it's easy to see what's outstanding.
 
-Markers next to a newcomer's name: 🗨 they replied, 📝 they posted an intro. A name in parentheses is who the rotation had assigned, shown when that isn't who got the credit. A `?` means that welcome was greeted before the bot started recording who clicked, so the name it's filed under is the assigned greeter rather than a confirmed clicker. Those only appear on welcomes from before this feature was added; nothing new gets a `?`.
+Markers next to a newcomer's name: 🗨 they replied by DM, 👋 they posted an intro, ✍️ they posted in another channel. A name in parentheses is who the rotation had assigned, shown when that isn't who got the credit. A `?` means that welcome was greeted before the bot started recording who clicked, so the name it's filed under is the assigned greeter rather than a confirmed clicker. Those only appear on welcomes from before this feature was added; nothing new gets a `?`.
 
 Pairings are read from the same records the stats come from, so anyone who was greeted before the bot was tracking clicks keeps their `?` permanently -- that information wasn't saved at the time and can't be recovered.
 
