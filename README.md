@@ -33,6 +33,7 @@ While the bot is running, Welcome Committee members can use these slash commands
 | `/welcome unsnooze USER` | Committee | Cancels the snooze early: Returns someone to the rotation. |
 | `/welcome stats` | Anyone | Shows joins, reach-outs, DM replies, intro posts, and posts in other channels for the last 30 days. |
 | `/welcome stats DAYS` | Anyone | Shows the same stats for the last DAYS days. |
+| `/welcome uptime` | Committee | Shows the percent of time the bot has been online over the last 24 hours, 7 days, and 365.25 days, and since January 1. |
 
 Discord still lists every command for everyone, so a non-committee member who tries a restricted one gets a private "committee members only" reply that nobody else in the channel sees.
 
@@ -62,6 +63,7 @@ vi .gitignore
     .env
     welcome-data.json
     node_modules
+    uptime-log.json
 ESC :wq ENTER
 cp .env.EXAMPLE .env
 ```
@@ -161,11 +163,13 @@ To test it without rebooting:
 
 A join only reaches the bot as a live event. If the bot is offline then anyone who joins during that window is never announced and never written to the data file.
 
-So every time the bot starts, before anything else it compares the server's member list (not the "someone joined" posts in the General channel) against welcome-data.json, and announces whatever it finds missing. Every member carries the exact timestamp of when they joined. The General channel is read only to recover the jump links for those joins.
+Every time the bot starts and whenever it comes back after losing its connection to Discord, it compares the server's member list against welcome-data.json, and announces whatever it finds missing. Every member carries the exact timestamp of when they joined. The General channel is read-only to recover the jump links for those joins.
 
-A recovery join is handled just like a live one -- next person in the rotation, same prompt, same ✅ and 🗨 reactions, same record -- with one extra line saying it was missed and how long ago the person joined.
+A recovery join is handled just like a live one, plus one extra line saying it was missed and how long ago the person joined.
 
-Before the batch, the bot posts one line saying how many it's catching up on. If there's nothing to catch up on -- the normal case -- it posts nothing at all and just notes it in the console.
+If the bot was offline for 5 minutes or more (DOWNTIME_NOTICE_MINUTES), it posts a Back online message saying roughly how long it was down and since when, even if there's nothing to catch up on. How long it was down comes from the uptime log (see [Uptime](#uptime)). After a crash, the log may be up to one save behind (configurable, 15 minutes). Shorter outages aren't announced.
+
+Before a batch of missed joins, the bot posts one line saying how many it's catching up on. If there's nothing to catch up on and the outage was too short for a notice, it posts nothing at all and just notes it in the console.
 
 Notes on how it behaves:
 
@@ -177,6 +181,7 @@ Notes on how it behaves:
 - The rotation is honoured by downtime recovery.
 - The posts are paced about a second apart to stay clear of Discord's rate limits.
 - It runs after the rest of startup, so a slow or failing recovery can't stop the bot coming online.
+- After a reconnect, it runs once Discord has confirmed the connection is live again, so it doesn't try to fetch the member list over a connection that died while the computer slept.
 - Caught-up records are flagged with `"catchUp": true` in welcome-data.json. Nothing in the stats treats them differently; it's there so it's clear why a welcome went out late.
 
 ## Watching the introductions channel
@@ -245,3 +250,18 @@ Once a week the bot posts a summary of the last 7 days to the Welcome Committee 
 By default it posts Mondays at 9am, in the local time of the machine running the bot -- not in any Discord member's own timezone. If the bot isn't running at that moment it posts the next time it is running later that same day; if it's down all day it skips that week. It posts at most once a day.
 
 The day and hour are the WEEKLY_DAY and WEEKLY_HOUR settings at the top of ncaau-discord-welcome-bot.js.
+
+## Uptime
+
+`/welcome uptime` shows how much of the time the bot has been online:
+
+- **Today** -- the last 24 hours
+- **Week** -- the last 7 days
+- **Year** -- the last 365.25 days
+- **2026** (the current year) -- since 12AM January 1, in the local time of the machine running the bot
+
+Once a minute, the bot checks that it's connected to Discord, meaning Discord has answered one of its regular heartbeats within the last 2 minutes. While connected, it notes in memory that it's still up. It writes uptime-log.json every 15 minutes, whenever it goes down or comes back, and when it's shut down cleanly with Ctrl+C or by closing its window. That means a crash or power cut loses at most the last 15 minutes of uptime. Percentages are rounded down, so any downtime at all keeps it from showing 100%.
+
+Coming back after an outage also triggers [downtime recovery](#downtime-recovery), which posts a notice if the bot was offline for 5 minutes or more.
+
+Uptime is only known from when this tracking was added. Until it has run for a full year, the longer spans are measured from when tracking began rather than counting the time before as downtime; the reply notes the start date when that's the case. Sessions older than a year are dropped from the log automatically, so the file stays small. Deleting uptime-log.json restarts tracking from scratch.

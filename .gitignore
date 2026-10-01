@@ -1,3 +1,4 @@
 .env
 welcome-data.json
 node_modules
+uptime-log.json

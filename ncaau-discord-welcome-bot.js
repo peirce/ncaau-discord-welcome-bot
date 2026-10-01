@@ -1,7 +1,7 @@
 
 const fs = require('node:fs');
 const {
-  Client, GatewayIntentBits, Events, Partials, SlashCommandBuilder, MessageType, SystemChannelFlagsBitField,
+  Client, GatewayIntentBits, Events, Partials, SlashCommandBuilder, MessageType, SystemChannelFlagsBitField, Status,
 } = require('discord.js');
 
 // ---------------- CONFIG ----------------
@@ -11,12 +11,14 @@ const CHANNEL_ID  = process.env.CHANNEL_ID;  // 👋-welcome-committee CHANNEL i
 const ROLE_ID     = process.env.ROLE_ID;     // Welcome Committee ROLE id
 const INTRO_ID    = process.env.INTRO_CHANNEL_ID; // 👋-introductions CHANNEL id (optional -- blank turns the watch off)
 const STATE_FILE  = './welcome-data.json';
+const UPTIME_FILE = './uptime-log.json';
 const WEEKLY_DAY  = 1;  // Weekly summary day: 0=Sun, 1=Mon ... 6=Sat
 const WEEKLY_HOUR = 9;  // Weekly summary hour (24h), in the HOST machine's local time
 const INTRO_DAYS  = 30; // Only announce an intro post (or first post elsewhere) from someone who joined within this many days
 const ANNOUNCE_OTHER_POSTS = true; // Notify the greeter of a newcomer's first post outside 👋-introductions (false = count it in stats only)
-const CATCHUP_DAYS = 7;  // On startup, look back this many days for joins missed while the bot was down (0 turns it off)
+const CATCHUP_DAYS = 7;  // After downtime, look back this many days for joins missed while the bot was down (0 turns it off)
 const CATCHUP_MAX  = 10; // Announce at most this many missed joins at once, so a lost state file can't flood the channel
+const DOWNTIME_NOTICE_MINUTES = 5; // Post a "back online" notice after being offline at least this long (0 turns it off)
 // ----------------------------------------
 
 for (const [name, value] of Object.entries({ DISCORD_TOKEN: TOKEN, GUILD_ID, CHANNEL_ID, ROLE_ID })) {
@@ -65,6 +67,26 @@ function saveData() {
     fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
     console.error('Could not save state:', e);
+  }
+}
+
+// ---- Uptime log ----
+// Kept apart from welcome-data.json since it's rewritten much more often.
+// Each session is [start, end] in ms: a stretch the bot was connected to Discord.
+let uptime = { trackingSince: null, sessions: [] };
+try {
+  const loaded = JSON.parse(fs.readFileSync(UPTIME_FILE, 'utf8'));
+  uptime = { trackingSince: loaded.trackingSince ?? null, sessions: loaded.sessions ?? [] };
+} catch {
+  // First run, or unreadable. Tracking starts now.
+}
+let uptimeSavedAt = 0;
+function saveUptime() {
+  uptimeSavedAt = Date.now();
+  try {
+    fs.writeFileSync(UPTIME_FILE, JSON.stringify(uptime));
+  } catch (e) {
+    console.error('Could not save uptime log:', e);
   }
 }
 
@@ -179,6 +201,10 @@ const welcomeCommand = new SlashCommandBuilder()
       .addIntegerOption((opt) =>
         opt.setName('days').setDescription('Or for the last now many days? (Default is 30.)').setMinValue(1)
       )
+  )
+  .addSubcommand((sub) =>
+    sub.setName('uptime')
+      .setDescription("Shows the percent of time the bot has been online over the last day, week, year.")
   );
 
 client.once(Events.ClientReady, async (c) => {
@@ -193,20 +219,22 @@ client.once(Events.ClientReady, async (c) => {
     console.error('ERROR during startup -- check GUILD_ID and bot permissions:', e);
     process.exit(1);
   }
+  heartbeat();
+  setInterval(tick, TICK_MS);
   maybePostWeekly();
   setInterval(maybePostWeekly, 15 * 60 * 1000); // re-check every 15 min
 
   // The downtime recovery is last so it can't hold up the rest of startup.
   try {
-    await catchUpOnMissedJoins(guild);
+    await recoverFromDowntime(guild);
   } catch (e) {
     console.error('The welcome bot is operational, but a startup error occurred during downtime recovery which may prevent new members who joined during the downtime from being recognized, so please check manually for any recently missed joins:', e);
   }
 });
 
 // Discord posts a "X joined the server" system message.
-// Returns null if join notifications are off, or if there's no system channel, 
-// or if the bot can't see it any of which just means the prompt goes out with no link.
+// Returns null if join notifications are off, or if there's no system channel, or if the bot can't see it.
+// Any of those cause the prompt to go out without a link.
 async function findJoinMessageUrl(guild, member) {
   if (guild.systemChannelFlags.has(SystemChannelFlagsBitField.Flags.SuppressJoinNotifications)) return null;
   const sysChannel = guild.systemChannel;
@@ -228,14 +256,15 @@ async function committeeMembers(guild) {
   return guild.members.cache.filter((m) => m.roles.cache.has(ROLE_ID) && !m.user.bot);
 }
 
-function howLongAgo(ts) {
-  const mins = Math.max(1, Math.round((Date.now() - ts) / 60000));
-  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+function howLong(ms) {
+  const mins = Math.max(1, Math.round(ms / 60000));
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'}`;
   const hours = Math.round(mins / 60);
-  if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'}`;
   const days = Math.round(hours / 24);
-  return `${days} day${days === 1 ? '' : 's'} ago`;
+  return `${days} day${days === 1 ? '' : 's'}`;
 }
+const howLongAgo = (ts) => `${howLong(Date.now() - ts)} ago`;
 
 // Assigns the next greeter, posts the prompt, and records the welcome.
 // This is used during live joins and downtime recovery.
@@ -345,24 +374,35 @@ async function recentJoinMessageUrls(guild, since) {
   return urls;
 }
 
-async function catchUpOnMissedJoins(guild) {
-  if (!CATCHUP_DAYS) return;
+async function catchUpOnMissedJoins(guild, downtime = null) {
+  const downMs = downtime ? downtime.to - downtime.from : 0;
+  const notice = DOWNTIME_NOTICE_MINUTES && downMs >= DOWNTIME_NOTICE_MINUTES * 60000
+    ? `🔌 Back online after about ${howLong(downMs)} offline, since <t:${Math.floor(downtime.from / 1000)}:f>.`
+    : null;
+  if (!CATCHUP_DAYS && !notice) return;
 
   const channel = await guild.channels.fetch(CHANNEL_ID).catch(() => null);
   if (!channel || !channel.isTextBased()) {
     console.error('Downtime recovery skipped: Could not identify the Welcome channel -- check CHANNEL_ID and permissions.');
     return;
   }
+  if (!CATCHUP_DAYS) {
+    await channel.send({ content: notice, allowedMentions: { parse: [] } }).catch(() => {});
+    return;
+  }
 
   const since = Date.now() - CATCHUP_DAYS * 86400000;
-  const committee = await committeeMembers(guild); // also fills the member cache read just below
+  const committee = await committeeMembers(guild);
   let queue = [...guild.members.cache.values()]
     .filter((m) => !m.user.bot && !joinsInFlight.has(m.id)
       && m.joinedTimestamp >= since && !alreadyRecorded(m.id, m.joinedTimestamp))
-    .sort((a, b) => a.joinedTimestamp - b.joinedTimestamp); // oldest first, so the rotation advances in join order
+    .sort((a, b) => a.joinedTimestamp - b.joinedTimestamp); // sorts oldest first, so the rotation advances in join order.
 
   if (queue.length === 0) {
     console.log(`Downtime recovery: Nothing missed in the last ${CATCHUP_DAYS} days.`);
+    if (notice) {
+      await channel.send({ content: `${notice} Downtime recovery: No missed joins to announce.`, allowedMentions: { parse: [] } }).catch(() => {});
+    }
     return;
   }
 
@@ -371,6 +411,7 @@ async function catchUpOnMissedJoins(guild) {
   queue = queue.slice(-CATCHUP_MAX);
 
   const header = [
+    ...(notice ? [notice] : []),
     `🔄 **Downtime recovery** -- ${total} join${total === 1 ? '' : 's'} from the last ${CATCHUP_DAYS} days went unannounced while the bot was offline.` +
       (held.length ? ` Posting the ${queue.length} most recent:` : ''),
   ];
@@ -736,6 +777,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.reply({ content: buildStatsText(days, title) });
     return;
   }
+
+  if (sub === 'uptime') {
+    await interaction.reply({ content: buildUptimeText() });
+    return;
+  }
 });
 
 // ---- Weekly summary ----
@@ -750,6 +796,109 @@ async function maybePostWeekly() {
   await channel.send(buildStatsText(7, '📅  **Weekly welcome summary -- last 7 days**')).catch(() => {});
   data.lastWeekly = todayKey;
   saveData();
+}
+
+// ---- Uptime ----
+// Once a minute, while connected, the bot stretches the current session's end to now, in memory.
+// The log is written to disk every 15 minutes, whenever a session starts or ends, and on a clean
+// shutdown, so a crash loses at most the last 15 minutes of uptime.
+// A session ends when the connection drops, or when a check comes much later than scheduled (the
+// host slept), so downtime isn't counted as uptime.
+const TICK_MS = 60 * 1000;
+const SAVE_MS = 15 * 60 * 1000;
+const YEAR_MS = 365.25 * 86400000;
+let currentSession = null;
+// When the latest outage began: the end of the last session before it. It starts as the end of the
+// previous run, and is cleared once the downtime recovery has run.
+let outageStart = uptime.sessions.at(-1)?.[1] ?? null;
+
+// Connected by Discord's own account: the gateway is up and has acknowledged a heartbeat (sent about
+// every 41 seconds) within the last 2 minutes. client.isReady() can't be used, since it stays true
+// through disconnects. The heartbeat check also catches a connection that died while the host slept,
+// which reads as up until discord.js notices. A lastPingTimestamp of -1 means just started, no heartbeat yet.
+function isConnected() {
+  const shard = client.ws.shards.first();
+  if (shard?.status !== Status.Ready) return false;
+  return shard.lastPingTimestamp === -1 || Date.now() - shard.lastPingTimestamp < 2 * 60 * 1000;
+}
+
+function heartbeat() {
+  const now = Date.now();
+  if (currentSession && now - currentSession[1] <= 3 * TICK_MS && isConnected()) {
+    currentSession[1] = now;
+    if (now - uptimeSavedAt >= SAVE_MS) saveUptime();
+    return;
+  }
+  if (currentSession) {
+    outageStart ??= currentSession[1];
+    currentSession = null;
+    saveUptime();
+  }
+  if (isConnected()) {
+    currentSession = [now, now];
+    uptime.sessions.push(currentSession);
+    uptime.trackingSince ??= now;
+    // Nothing reports further back than a year, so older sessions are dropped.
+    uptime.sessions = uptime.sessions.filter(([, end]) => end >= now - YEAR_MS - 86400000);
+    saveUptime();
+  }
+}
+
+// Once back up after an outage, the bot catches up on joins missed in the meantime and says how long
+// it was down. (At startup, ClientReady does this itself.)
+function tick() {
+  heartbeat();
+  if (outageStart !== null && currentSession) {
+    recoverFromDowntime(client.guilds.cache.get(GUILD_ID)).catch((e) => {
+      console.error('ERROR: Downtime recovery failed after a reconnect, so please check manually for any recently missed joins:', e);
+    });
+  }
+}
+
+async function recoverFromDowntime(guild) {
+  const downtime = outageStart !== null && currentSession ? { from: outageStart, to: currentSession[0] } : null;
+  outageStart = null;
+  await catchUpOnMissedJoins(guild, downtime);
+}
+
+// A clean shutdown (Ctrl+C, or closing the console window) records when it stopped, so the log
+// doesn't lose the time since the last 15-minute save.
+for (const signal of ['SIGINT', 'SIGHUP', 'SIGBREAK', 'SIGTERM']) {
+  process.on(signal, () => {
+    heartbeat();
+    saveUptime();
+    process.exit(0);
+  });
+}
+
+// Percent of the time from `from` to `now` that the bot was up. Time before tracking began
+// isn't counted either way, so the span is clipped to start there.
+function uptimePercent(from, now) {
+  const start = Math.max(from, uptime.trackingSince ?? now);
+  if (start >= now) return 100;
+  let up = 0;
+  for (const [s, e] of uptime.sessions) up += Math.max(0, Math.min(e, now) - Math.max(s, start));
+  return Math.min(100, (up / (now - start)) * 100);
+}
+
+function buildUptimeText() {
+  heartbeat(); // counts the stretch since the last beat, since the bot is plainly up right now
+  const now = Date.now();
+  const nowDate = new Date();
+  const yearStart = new Date(nowDate.getFullYear(), 0, 1).getTime(); // 12:00 AM on Jan 1, host's local time.
+  // Rounded down so a sliver of downtime never shows as 100%.
+  const pct = (from) => `${Math.floor(uptimePercent(from, now) * 10) / 10}%`;
+  const lines = [
+    '**Welcome Bot Uptime**',
+    `Today: ${pct(now - 86400000)}`,
+    `Week: ${pct(now - 7 * 86400000)}`,
+    `Year: ${pct(now - YEAR_MS)}`,
+    `${nowDate.getFullYear()}: ${pct(yearStart)}`,
+  ];
+  if (uptime.trackingSince > now - YEAR_MS) {
+    lines.push(`_Tracking began <t:${Math.floor(uptime.trackingSince / 1000)}:D>, so any span reaching back further is measured from then._`);
+  }
+  return lines.join('\n');
 }
 
 client.login(TOKEN);
